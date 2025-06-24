@@ -761,7 +761,7 @@ class VariationalEncoder(nn.Module):
     def reparametrize(self, z, temperature: float = 1.):
         mean, scale = z.chunk(2, 1)
         mean = tb.mark(mean, name="latent_mean")
-        std = nn.functional.softplus(scale) + 1e-4
+        std = self.std_from_scale(scale)
         std = tb.mark(std, name="latent_std")
         var = std * std
         logvar = torch.log(var)
@@ -771,6 +771,9 @@ class VariationalEncoder(nn.Module):
         z = tb.mark(z, name="latent")
 
         return z, self.beta * kl
+
+    def std_from_scale(self, scale):
+        return nn.functional.softplus(scale) + 1e-4
 
     def set_warmed_up(self, state: bool):
         state = torch.tensor(int(state), device=self.warmed_up.device)
