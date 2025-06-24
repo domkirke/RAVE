@@ -672,16 +672,17 @@ class RAVE(pl.LightningModule):
                 
                 z_batch = latent_buffer_sampled[0]
                 self._record_vintage_pca(z_batch)
-                self._log_fidelity(self.fidelity, "pca_1batch")
+                self._log_fidelity(self.fidelity, "pca_1")
 
                 # updated pca computation : perform differnt pca on several batches, and on full valid examples
                 self._record_pca(latent_buffer)
-                self._log_fidelity(self.projections['pca_full_mean'][1], "pca_%dbatch"%MAX_LATENT_FOR_VALIDATION)
+                self._log_fidelity(self.projections['pca_full_mean'][1], "pca_%d_mean"%MAX_LATENT_FOR_VALIDATION)
+                self._log_fidelity(self.projections['pca_full_sampled'][1], "pca_%d_sampled"%MAX_LATENT_FOR_VALIDATION)
 
                 z_full = torch.stack(self.latent_val_buffer, 0)
                 z_mean, z_std = z_full.split(z_full.shape[1] // 2, -2)
-                self.logger.experiment.add_histogram("latent_mean_val", z_mean)
-                self.logger.experiment.add_histogram("latent_std_val", self.encoder.std_from_scale(z_std))
+                self.logger.experiment.add_histogram("latent_mean_val", z_mean.flatten(), self.eval_number)
+                self.logger.experiment.add_histogram("latent_std_val", self.encoder.std_from_scale(z_std).flatten(), self.eval_number)
                 #z = torch.cat(z, 0)
                 
 
