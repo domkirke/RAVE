@@ -278,6 +278,13 @@ class RAVE(pl.LightningModule):
             optimizers.append({'optimizer': dis_opt})
             return tuple(optimizers)
 
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        projections_keys = filter(lambda x: x.startswith('projections.'), state_dict.keys())
+        for p in projections_keys:
+            proj_name = p.replace('projections.', '')
+            self.projections[proj_name] = state_dict[p].clone()
+        return super().load_state_dict(state_dict, strict, assign)
+
     def import_weights(self, weight_dict, strict=False):
         state_dict = self.state_dict()
         invalid_keys = []

@@ -256,7 +256,7 @@ def main(argv):
         max_steps=FLAGS.max_steps,
         profiler="simple",
         # limit_train_batches=1,
-        # limit_val_batches=10,
+        # limit_val_batches=30,
         # fast_dev_run=True,
         enable_progress_bar=FLAGS.progress,
         log_every_n_steps=min(30, len(train)),

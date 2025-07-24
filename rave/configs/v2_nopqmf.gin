@@ -57,6 +57,7 @@ blocks.EncoderV2:
 
 blocks.VariationalEncoder:
     encoder = @variational/blocks.EncoderV2
+    # varmode = "sigmoid"
 
 # GENERATOR
 blocks.GeneratorV2:
@@ -116,7 +117,7 @@ rave.RAVE:
 
 rave.BetaWarmupCallback:
     initial_value = 1e-6
-    target_value = 5e-2
+    target_value = 1e-3
     warmup_len = 500000
     log = False
     

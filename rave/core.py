@@ -102,6 +102,8 @@ def get_versions(folder):
     return sorted(Path(dirpath).iterdir(), key=os.path.getmtime)
 
 def search_for_config(folder):
+    if not Path(folder).exists():
+        raise FileNotFoundError(folder)
     if os.path.isfile(folder):
         folder = os.path.dirname(folder)
     configs = list(map(str, Path(folder).rglob("config.gin")))
