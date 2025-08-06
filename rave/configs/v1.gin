@@ -98,6 +98,7 @@ rave.RAVE:
     encoder = @blocks.VariationalEncoder  
     decoder = @blocks.Generator
     discriminator = @discriminator.MultiScaleDiscriminator
+    n_channels = 1
     phase_1_duration = %PHASE_1_DURATION
     gan_loss = @core.hinge_gan
     valid_signal_crop = False

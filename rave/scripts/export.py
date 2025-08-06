@@ -43,6 +43,9 @@ flags.DEFINE_string('run',
 flags.DEFINE_bool('streaming',
                   default=False,
                   help='Enable the model streaming mode')
+flags.DEFINE_integer('channels', 
+                     default = None, 
+                     help = "manually sets number of audio channels (may be required for old checkpoints)")
 flags.DEFINE_float(
     'fidelity',
     default=.95,
@@ -712,9 +715,9 @@ def main(argv):
     # FLAGS.run = rave.core.search_for_run(FLAGS.run)
 
     try:
-        pretrained, model_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights)
-    except: 
-        pretrained, model_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, name=None)
+        pretrained, model_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, n_channels=FLAGS.channels)
+    except Exception as e: 
+        pretrained, model_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, n_channels=FLAGS.channels, name=None)
     pretrained.eval()
     output = FLAGS.out_path or os.path.dirname(FLAGS.run)
     model_name = FLAGS.name or rave.get_run_name(model_path)
@@ -777,9 +780,10 @@ def main(argv):
 
     # cc.MAX_BATCH_SIZE = 1
     logging.info("script model")
+    n_channels = FLAGS.channels or pretrained.n_channels
     scripted_rave = script_class(
         pretrained=pretrained,
-        channels = pretrained.n_channels,
+        channels = n_channels,
         fidelity=FLAGS.fidelity,
         target_sr=FLAGS.sr,
         prior = prior_scripted,
@@ -787,7 +791,7 @@ def main(argv):
         **class_kwargs
     )
 
-    x = torch.zeros(1, pretrained.n_channels, 2**14)
+    x = torch.zeros(1, n_channels, 2**14)
     scripted_rave.init_cache(x)
     z = scripted_rave.encode(x)
     x = scripted_rave.decode(z)
@@ -802,7 +806,7 @@ def main(argv):
         os.makedirs(output)
     scripted_rave.export_to_ts(os.path.join(output, model_name))
     try:
-        if pretrained.n_channels <= 2:
+        if n_channels <= 2:
             # test stereo mode for VST export
             scripted_rave.set_stereo_mode(True)
             z_vst_input = torch.zeros(2, scripted_rave.full_latent_size, z.shape[-1])

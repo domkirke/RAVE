@@ -64,7 +64,7 @@ def get_run_name(run_path):
         return None
     return ((version_path / "..").resolve()).stem
 
-def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", remove_keys=None, configs=[], overrides=[]):
+def load_rave_checkpoint(model_path, n_channels=None, ema=False, name="last.ckpt", remove_keys=None, configs=[], overrides=[]):
     model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(str(model_path))
@@ -75,6 +75,14 @@ def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", 
         if config_file is None:
             print('no configuration file found at address :'%model_path)
         gin.parse_config_files_and_bindings([config_file] + configs, overrides)
+        if n_channels is not None:
+            try:
+                original_channels = gin.get_bindings("model.RAVE.n_channels")
+                if original_channels != n_channels: raise ValueError("asked %d channels, but found %d channels in config."%(n_channels, original_channels))
+            except ValueError:
+                # n_channels not present ; add it 
+                with gin.unlock_config():
+                    gin.bind_parameter("model.RAVE.n_channels", n_channels)
         run_path = core.search_for_run(model_path, name=name)
         if run_path is None: 
             raise FileNotFoundError("no model found with name: %s"%name)
