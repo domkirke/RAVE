@@ -624,12 +624,13 @@ class RAVE(pl.LightningModule):
         pca = FastICA(z.shape[-1], whiten='unit-variance').fit(z)
         components = pca.components_
         mixing = pca.mixing_
+        mean = pca.mean_
 
         components = torch.from_numpy(components)
         mixing = torch.from_numpy(mixing)
         whitening = torch.from_numpy(pca.whitening_)
 
-        return torch.stack([components, mixing, whitening])
+        return torch.stack([mean[None], components, mixing, whitening])
 
 
     def _record_vintage_pca(self, z):
