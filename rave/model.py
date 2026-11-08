@@ -1,4 +1,5 @@
 import math
+import acids_dataset as ad
 from absl import logging
 import os
 from time import time
@@ -207,6 +208,7 @@ class RAVE(pl.LightningModule):
         update_pca=True,
         gradient_clip_gen: Optional[float] = None,
         gradient_clip_dis: Optional[float] = None,
+        output_transforms: Optional[ad.transforms.AudioTransform] = None
     ):
         super().__init__()
         self.pqmf = pqmf(n_channels=n_channels) if pqmf is not None else None
@@ -272,6 +274,7 @@ class RAVE(pl.LightningModule):
 
         self.register_buffer("receptive_field", torch.tensor([0, 0]).long())
         self.audio_monitor_epochs = audio_monitor_epochs
+        self.output_transforms = output_transforms
 
     @gin.configurable(module="rave")
     def configure_optimizers(self, weight_list = None, lr_gen=1.e-4, lr_dis = 1.e-4):
@@ -463,6 +466,12 @@ class RAVE(pl.LightningModule):
             loss_weight = (loss_target - loss_init) / n_steps * batch_idx + loss_init
             if clamp: loss_weight = np.clip(loss_weight, min(loss_init, loss_target), max(loss_init, loss_target))
         return loss_weight
+
+    def _invert(self, x):
+        if self.output_transforms is None: 
+            return x
+        else:
+            return self.output_transforms.invert(x)
 
     def encode_compressed(self, x, fidelity = 0.99):
         z = self.encode(x, return_mb=False)
@@ -860,7 +869,7 @@ class RAVE(pl.LightningModule):
         y = audio.reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", y, self.eval_number,
+        self.logger.experiment.add_audio("audio_val", self._invert(y), self.eval_number,
                                         self.sr)
         self.eval_number += 1
         self.audio_val_buffer = []

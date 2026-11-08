@@ -33,7 +33,8 @@ except:
 import rave.blocks
 import rave.core
 from rave.stft import CausalSTFT, StreamableSTFT
-from rave.cachedConv2D import CachedPadding2d, CachedConvTranspose2d
+from rave.cachedConv2D import CachedPadding2d as CachedPadding2d_backward
+from cached_conv import CachedConvTranspose2d, CachedPadding
 import rave.resampler
 from rave.prior import model as prior
 
@@ -854,9 +855,9 @@ def main(argv):
     if FLAGS.streaming:
         # Warmup and nn~ checks populate caches. Do not serialize that state.
         for module in scripted_rave.modules():
-            if isinstance(module, CachedPadding2d):
+            if isinstance(module, (CachedPadding2d_backward, CachedPadding)):
                 module.pad = module.pad[:0].clone()
-            elif isinstance(module, CachedConvTranspose2d):
+            elif isinstance(module, (CachedConvTranspose2d, CachedPadding2d_backward)):
                 module.cache = module.cache[:0].clone()
             elif isinstance(module, CausalSTFT):
                 module.audio_buffer = module.audio_buffer[:0].clone()

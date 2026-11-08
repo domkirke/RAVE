@@ -810,7 +810,7 @@ class Encoder2D(nn.Module):
             activation=activation)
         self.rearrange_encode = Rearrange('b c f t -> b (c f) t')
         
-        self.reccurent_layer = recurrent_layer(latent_size * n_out) if recurrent_layer is not None else None
+        self.recurrent_layer = None if recurrent_layer is None else recurrent_layer(latent_size * n_out)
     
         
         
@@ -826,7 +826,7 @@ class Encoder2D(nn.Module):
         x = self.rearrange_encode(x)
         x = self.middle_block_encode(x)
         if self.recurrent_layer is not None:
-            x = self.reccurent_layer(x)
+            x = self.recurrent_layer(x)
         return x
         
         

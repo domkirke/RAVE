@@ -25,7 +25,7 @@ ad.fragments.base.FORCE_ARRAY_RESHAPE = False
 import rave
 import rave.core
 import rave.dataset
-from rave.dataset import get_augmentations, parse_transform
+from rave.dataset import get_augmentations, parse_transform, NORMALIZE_MODES
 
 
 FLAGS = flags.FLAGS
@@ -60,15 +60,18 @@ flags.DEFINE_integer('seed',
 flags.DEFINE_integer('n_signal',
                      131072,
                      help='Number of audio samples to use during training')
-flags.DEFINE_integer('channels', 0, help="number of audio channels")
+flags.DEFINE_bool('stereo', False, help="flag to force stereo training")
+flags.DEFINE_bool('midside', False, help="flag to force stereo mid-side training")
+flags.DEFINE_bool('ambisonics', False, help="activates ambisonic mode : encodes the input signal before training")
+flags.DEFINE_integer('channels', 1, help="overrides the exact number of training channels (0 takes the one from dataset)")
 flags.DEFINE_integer('batch', 8, help='Batch size')
 flags.DEFINE_string('ckpt',
                     None,
                     help='Path to previous checkpoint of the run')
-flags.DEFINE_multi_string('transfer', 
+flags.DEFINE_multi_string('init_from', 
                           [], 
                           help="Transfer keys from an existing model. Must be of format path_to_ckpt=>pattern1,pattern2 ; see README.md for more explanation")
-flags.DEFINE_bool('strict_transfer', default=True, help = "allows uncomplete transfer if keys are not found (default: None)")                        
+flags.DEFINE_bool('strict_init', default=True, help = "allows uncomplete transfer if keys are not found (default: None)")                        
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
 flags.DEFINE_integer('workers',
                      default=0,
@@ -77,9 +80,12 @@ flags.DEFINE_multi_string('device', default="auto", help="training device (defau
 flags.DEFINE_bool('derivative',
                   default=False,
                   help='Train RAVE on the derivative of the signal')
-flags.DEFINE_bool('normalize',
-                  default=False,
-                  help='Train RAVE on normalized signals')
+flags.DEFINE_string('normalize',
+                  default="none",
+                  help='Normalizes audio input before loading. Valid options : %s'%NORMALIZE_MODES)
+flags.DEFINE_bool('normalize_dataset', 
+                  default=False, 
+                  help="Pre-computes loundess of the whole dataset and normalizes input / output data.")
 flags.DEFINE_list('rand_pitch',
                   default=None,
                   help='activates random pitch')
@@ -142,7 +148,10 @@ def main(argv):
     torch.backends.cudnn.benchmark = True
 
     # check dataset channels
-    n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels) if not FLAGS.channels else FLAGS.channels
+    n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels, FLAGS.stereo, FLAGS.midside, FLAGS.ambisonics) 
+    gin.constant('MIDSIDE', FLAGS.midside)
+    gin.constant('AMBISONICS', FLAGS.ambisonics)
+    gin.constant('SAMPLE_RATE', FLAGS.sr)
     FLAGS.override.append('RAVE.n_channels=%d'%n_channels)
     if FLAGS.beta: FLAGS.override.append("model.BetaWarmupCallback.target_value=%r"%FLAGS.beta)
     
@@ -160,40 +169,40 @@ def main(argv):
             FLAGS.override,
         )
 
-    gin_hash = hashlib.md5(
-        gin.operative_config_str().encode()).hexdigest()[:10]
-    RUN_NAME = f'{FLAGS.name}_{gin_hash}'
-
-    # create model
-    model = rave.RAVE(n_channels=n_channels)
-
-    # transfer keys if needed
-    if len(FLAGS.transfer) > 0: 
-        for pattern in FLAGS.transfer:
-            weight_dict = rave.core.get_weights_from_pattern(pattern)
-            model.import_weights(weight_dict, strict=FLAGS.strict_transfer)
-
-    if FLAGS.derivative:
-        #TODO replace with transform
-        model.integrator = rave.dataset.get_derivator_integrator(model.sr)[1]
-    gin.constant('SAMPLE_RATE', model.sr)
-    
     # parse augmentations
     augmentations = rave.parse_augmentations(map(rave.add_gin_extension, FLAGS.augment), sr=model.sr)
     with gin.unlock_config():
         gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
 
+
+    gin_hash = hashlib.md5(
+        gin.operative_config_str().encode()).hexdigest()[:10]
+    RUN_NAME = f'{FLAGS.name}_{gin_hash}'
+
     # parse datasset
-    dataset = rave.dataset.get_dataset(FLAGS.db_path,
-                                       model.sr,
-                                       FLAGS.n_signal,
-                                       derivative=FLAGS.derivative,
-                                       normalize=FLAGS.normalize,
-                                       rand_pitch=FLAGS.rand_pitch,
+    dataset, output_transforms = rave.dataset.get_dataset(FLAGS.db_path,
+                                       gin.get_bindings('SAMPLING_RATE'),
+                                       flags=FLAGS,
                                        augmentations=augmentations,
                                        n_channels=n_channels)
 
     train, val = rave.dataset.split_dataset(dataset, percent=98, training_name=RUN_NAME)
+
+
+    # create model
+    model = rave.RAVE(n_channels=n_channels, output_transforms=output_transforms)
+
+    # transfer keys if needed
+    if len(FLAGS.init_from) > 0: 
+        for pattern in FLAGS.init_from:
+            weight_dict = rave.core.get_weights_from_pattern(pattern)
+            model.import_weights(weight_dict, strict=FLAGS.strict_init)
+
+    if FLAGS.derivative:
+        #TODO replace with transform
+        model.integrator = rave.dataset.get_derivator_integrator(model.sr)[1]
+
+    
 
     num_workers = rave.core.get_workers(FLAGS.workers)
     train = DataLoader(train,
