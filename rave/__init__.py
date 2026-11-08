@@ -79,7 +79,7 @@ def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", 
         if run_path is None: 
             raise FileNotFoundError("no model found with name: %s"%name)
         rave_model = RAVE()
-        checkpoint = torch.load(run_path, map_location='cpu')
+        checkpoint = torch.load(run_path, map_location='cpu', weights_only=True)
         if remove_keys is not None: 
             if not isinstance(remove_keys, list): remove_keys = [remove_keys]
             weights_to_remove = []
