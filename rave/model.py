@@ -869,10 +869,10 @@ class RAVE(pl.LightningModule):
     def _compute_ica(self, z):
         z = rearrange(z, "b c t -> (b t) c")
         
-        pca = FastICA(z.shape[-1], whiten='unit-variance').fit(z)
+        pca = FastICA(z.shape[-1], whiten="unit-variance").fit(z)
         components = pca.components_
         mixing = pca.mixing_
-        mean = pca.mean_
+        mean = torch.from_numpy(pca.mean_).unsqueeze(0).repeat_interleave(pca.mean_.shape[0], dim=0)
 
         components = torch.from_numpy(components)
         mixing = torch.from_numpy(mixing)
@@ -897,9 +897,6 @@ class RAVE(pl.LightningModule):
         # record full pca from means
         pca, mean, var = self._compute_pca(latent_full[:, :latent_full.shape[1] // 2])
         self.projections['pca_full_mean'] = torch.cat([mean[None], var[None], pca], 0).cpu()
-        # record full sampled pca
-        pca, mean, var = self._compute_pca(self.encoder.reparametrize(latent_full)[0])
-        self.projections['pca_full_sampled'] = torch.cat([mean[None], var[None], pca], 0).cpu()
         # record IPCA from mean
         pca, mean, var = self._compute_ipca(latent_full[:, :latent_full.shape[1] // 2])
         self.projections['ipca'] = torch.cat([mean[None], var[None], pca], 0).cpu()
@@ -933,7 +930,6 @@ class RAVE(pl.LightningModule):
                 # updated pca computation : perform differnt pca on several batches, and on full valid examples
                 self._record_pca(latent_buffer)
                 self._log_fidelity(self.projections['pca_full_mean'][1], "pca_%d_mean"%MAX_LATENT_FOR_VALIDATION)
-                self._log_fidelity(self.projections['pca_full_sampled'][1], "pca_%d_sampled"%MAX_LATENT_FOR_VALIDATION)
 
                 z_full = torch.stack(self.latent_val_buffer, 0)
                 z_mean, z_std = z_full.split(z_full.shape[1] // 2, -2)

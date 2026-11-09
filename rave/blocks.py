@@ -7,12 +7,17 @@ try:
     import torchbend as tb
     mark_fn = tb.mark
 except ModuleNotFoundError:
-    @torch.jit.ignore
-    def mark_fn(obj=None, *args, **kwargs):
-        if obj is None: 
-            return lambda x: x
-        else:
+    if torch.jit.is_scripting() or torch.jit.is_tracing(): 
+        @torch.jit.script
+        def mark_fn(obj=None, name: Optional[str] = None, mode: Optional[str] = "post"):
             return obj
+    else:
+        @torch.jit.ignore
+        def mark_fn(obj=None, name: Optional[str] = None, mode: Optional[str] = "post"):
+            if obj is None: 
+                return lambda x: x
+            else:
+                return obj
 
     class MarkPlaceholder:
 
@@ -910,7 +915,7 @@ class GeneratorV2(nn.Module):
                         )))
 
         net.append(
-            mark_fn(activation(num_channels), "decoder_act")
+            mark_fn(activation(num_channels), "decoder_act", mode="post")
         )
 
         waveform_module = normalization(
@@ -939,13 +944,13 @@ class GeneratorV2(nn.Module):
 
         noise = 0.
         if self.noise_module is not None:
-            noise = mark_fn(self.noise_module(x), "noise")
+            noise = mark_fn(self.noise_module(x), "noise", mode="post")
             x = self.waveform_module(x)
 
         if self.amplitude_modulation:
             x, amplitude = x.split(x.shape[1] // 2, 1)
-            x = mark_fn(x, "audio")
-            amplitude = mark_fn(torch.sigmoid(amplitude), "amplitude")
+            x = mark_fn(x, "audio", "post")
+            amplitude = mark_fn(torch.sigmoid(amplitude), "amplitude", mode="post")
             x = x * amplitude
 
         x = x + noise
@@ -1125,7 +1130,7 @@ class VariationalEncoder(nn.Module):
 
         z = torch.randn_like(mean) * temperature * std + mean
         kl = (mean * mean + var - logvar - 1).sum(1).mean()
-        z = mark_fn(z, name="latent")
+        z = mark_fn(z, name="latent", mode="post")
 
         return z, self.beta * kl
 
@@ -1142,7 +1147,7 @@ class VariationalEncoder(nn.Module):
         self.warmed_up = state
 
     def forward(self, x: torch.Tensor):
-        z = mark_fn(self.encoder(x), name="encoder_out")
+        z = mark_fn(self.encoder(x), name="encoder_out", mode="post")
 
         if self.warmed_up and not self.no_freeze_when_warmed_up:
             z = z.detach()
