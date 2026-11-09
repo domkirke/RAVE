@@ -79,7 +79,6 @@ flags.DEFINE_string('prior',
 
 
 
-
 def get_state_dict(RUN, PRIOR):
     state_dict = torch.load(PRIOR, map_location="cpu")['state_dict']
     for k, v in RUN.state_dict().items():

@@ -6,34 +6,19 @@ import torch.nn as nn
 try:
     import torchbend as tb
     mark_fn = tb.mark
+    mark_tensor = tb.mark
 except ModuleNotFoundError:
-    if torch.jit.is_scripting() or torch.jit.is_tracing(): 
-        @torch.jit.script
-        def mark_fn(obj=None, name: Optional[str] = None, mode: Optional[str] = "post"):
-            return obj
-    else:
-        @torch.jit.ignore
-        def mark_fn(obj=None, name: Optional[str] = None, mode: Optional[str] = "post"):
-            if obj is None: 
-                return lambda x: x
-            else:
-                return obj
+    tb = None
 
-    class MarkPlaceholder:
+    def mark_fn(obj=None, name: Optional[str] = None, mode: Optional[str] = "post"):
+        """construction-time fallback (modules / decorators): identity."""
+        if obj is None:
+            return lambda x: x
+        return obj
 
-        @staticmethod
-        def mark(obj: Optional[Any] = None, name: Optional[str] = None, mode: Optional[str] = "post") -> torch.Tensor:
-            if torch.jit.is_scripting() or torch.jit.is_tracing():
-                if torch.jit.isinstance(obj, torch.Tensor):
-                    return obj
-                else: 
-                    raise RuntimeError("when scripting, torchbend marking is only scriptable with tensors")
-            else: 
-                return mark_fn(obj, name, mode)
-                
-
-
-    tb = MarkPlaceholder
+    def mark_tensor(x: torch.Tensor, name: Optional[str] = None, mode: str = "post") -> torch.Tensor:
+        """forward-time fallback: scriptable tensor identity."""
+        return x
 
 import cached_conv as cc
 import gin
@@ -944,13 +929,13 @@ class GeneratorV2(nn.Module):
 
         noise = 0.
         if self.noise_module is not None:
-            noise = mark_fn(self.noise_module(x), "noise", mode="post")
+            noise = mark_tensor(self.noise_module(x), "noise", mode="post")
             x = self.waveform_module(x)
 
         if self.amplitude_modulation:
             x, amplitude = x.split(x.shape[1] // 2, 1)
-            x = mark_fn(x, "audio", "post")
-            amplitude = mark_fn(torch.sigmoid(amplitude), "amplitude", mode="post")
+            x = mark_tensor(x, "audio", "post")
+            amplitude = mark_tensor(torch.sigmoid(amplitude), "amplitude", mode="post")
             x = x * amplitude
 
         x = x + noise
@@ -1122,15 +1107,15 @@ class VariationalEncoder(nn.Module):
 
     def reparametrize(self, z, temperature: float = 1.):
         mean, scale = z.chunk(2, 1)
-        mean = tb.mark(mean, name="latent_mean")
+        mean = mark_tensor(mean, name="latent_mean")
         std = self.std_from_scale(scale)
-        std = tb.mark(std, name="latent_std")
+        std = mark_tensor(std, name="latent_std")
         var = std * std
         logvar = torch.log(var)
 
         z = torch.randn_like(mean) * temperature * std + mean
         kl = (mean * mean + var - logvar - 1).sum(1).mean()
-        z = mark_fn(z, name="latent", mode="post")
+        z = mark_tensor(z, name="latent", mode="post")
 
         return z, self.beta * kl
 
@@ -1147,7 +1132,7 @@ class VariationalEncoder(nn.Module):
         self.warmed_up = state
 
     def forward(self, x: torch.Tensor):
-        z = mark_fn(self.encoder(x), name="encoder_out", mode="post")
+        z = mark_tensor(self.encoder(x), name="encoder_out", mode="post")
 
         if self.warmed_up and not self.no_freeze_when_warmed_up:
             z = z.detach()
