@@ -49,26 +49,26 @@ def get_dataset(db_path,
     dataset = ad.datasets.AudioDataset(
         db_path,
         sr=sr,
-        n_channels = n_channels
+        channels=n_channels
     )
-    assert flags.get('normalize') in NORMALIZE_MODES
+    assert flags.normalize in NORMALIZE_MODES
     normalize_transform = None
-    if flags.get('normalize') == "each": 
+    if flags.normalize == "each": 
         normalize_transform = ad.transforms.Normalize(sr=sr, p=1.)
-    elif flags.get('normalize') == "compress": 
+    elif flags.normalize == "compress": 
         normalize_transform = ad.transforms.CompressRange((-40, -3))
-    elif flags.get('normalize') == "dataset": 
+    elif flags.normalize == "dataset": 
         dataset_peak = dataset.sample_features(ad.features.Peak(sr=sr), reduction=max)
         normalize_transform = ad.transforms.NormRange(dataset_peak)
-    elif flags.get('normalize') == "dataset_compress":
+    elif flags.normalize == "dataset_compress":
         dataset_range = dataset.sample_features(ad.features.LoudnessMeter("db_quantiles", sr=sr), reduction=max)
         normalize_transform = ad.transforms.CompressRange((-40, -3), dataset_range, mode="db")
 
     transform_list = []
     output_transform = None
     # stretch or crop
-    if flags.get('rand_pitch'):
-        transform_list.append(ad.transforms.Stretch(n_signal, flags.get('rand_pitch'), sr=sr))
+    if flags.rand_pitch:
+        transform_list.append(ad.transforms.Stretch(n_signal, flags.rand_pitch), sr=sr)
     else:
         transform_list.append(ad.transforms.Crop(n_signal, sr=sr))
         
@@ -77,21 +77,21 @@ def get_dataset(db_path,
         ad.transforms.PhaseMangle(sr=sr),
     ])
 
-    if flags.get('normalize'):
+    if flags.normalize:
         transform_list.append(normalize_transform)
 
-    if flags.get('derivative'):
+    if flags.derivative:
         transform_list.append(ad.transforms.Derivator(sr=sr))
 
     if augmentations:
         transform_list.extend(augmentations)
 
-    if flags.get('midside'): 
+    if flags.midside: 
         output_transform = ad.transforms.MidSide()
-        transform_list.extend(output_transform)
-    elif flags.get('ambisonics'):
+        transform_list.append(output_transform)
+    elif flags.ambisonics:
         output_transform = ad.transforms.AmbisonicEncoder()
-        transform_list.extend(output_transform)
+        transform_list.append(output_transform)
 
     dataset.transforms = transform_list
     return dataset, output_transform
@@ -108,14 +108,14 @@ def get_channels_from_dataset(db_path):
 
 def get_training_channels(db_path, target_channels, stereo=False, mid_side=False, ambisonics=False):
     dataset_channels = get_channels_from_dataset(db_path)
-    assert target_channels>0, "invalid number of channels : %s"%target_channels
-    assert sum([target_channels is not None, stereo, mid_side, ambisonics]) < 2, "provided several values for channels; please only give one"
+    assert target_channels>=0, "invalid number of channels : %s"%target_channels
+    assert sum([target_channels != 0, stereo, mid_side, ambisonics]) < 2, "provided several values for channels; please only give one"
     if stereo or mid_side: 
         target_channels = 2
     elif ambisonics: 
         if dataset_channels is None: dataset_channels = ad.get_channels_from_path(db_path, write=True)
         if len(dataset_channels) > 1: raise ValueError('dataset has disparate number of channels. Please ensure all files are matching a correct ambisonic order (order+1)^2')
-        dataset_channels = dataset_channels[0]
+        dataset_channels = list(dataset_channels)[0]
         if dataset_channels < 4: raise ValueError('dataset seems to have 1 channel; must be at least 4')
         order = math.sqrt(dataset_channels)
         if not order.is_integer():

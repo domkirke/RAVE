@@ -63,7 +63,7 @@ flags.DEFINE_integer('n_signal',
 flags.DEFINE_bool('stereo', False, help="flag to force stereo training")
 flags.DEFINE_bool('midside', False, help="flag to force stereo mid-side training")
 flags.DEFINE_bool('ambisonics', False, help="activates ambisonic mode : encodes the input signal before training")
-flags.DEFINE_integer('channels', 1, help="overrides the exact number of training channels (0 takes the one from dataset)")
+flags.DEFINE_integer('channels', 0, help="overrides the exact number of training channels (0 takes the one from dataset)")
 flags.DEFINE_integer('batch', 8, help='Batch size')
 flags.DEFINE_string('ckpt',
                     None,
@@ -151,7 +151,6 @@ def main(argv):
     n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels, FLAGS.stereo, FLAGS.midside, FLAGS.ambisonics) 
     gin.constant('MIDSIDE', FLAGS.midside)
     gin.constant('AMBISONICS', FLAGS.ambisonics)
-    gin.constant('SAMPLE_RATE', FLAGS.sr)
     FLAGS.override.append('RAVE.n_channels=%d'%n_channels)
     if FLAGS.beta: FLAGS.override.append("model.BetaWarmupCallback.target_value=%r"%FLAGS.beta)
     
@@ -170,7 +169,7 @@ def main(argv):
         )
 
     # parse augmentations
-    augmentations = rave.parse_augmentations(map(rave.add_gin_extension, FLAGS.augment), sr=model.sr)
+    augmentations = rave.parse_augmentations(map(rave.add_gin_extension, FLAGS.augment), sr=gin.query_parameter('%SAMPLING_RATE'))
     with gin.unlock_config():
         gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
 
@@ -181,7 +180,7 @@ def main(argv):
 
     # parse datasset
     dataset, output_transforms = rave.dataset.get_dataset(FLAGS.db_path,
-                                       gin.get_bindings('SAMPLING_RATE'),
+                                       gin.query_parameter('%SAMPLING_RATE'),
                                        flags=FLAGS,
                                        augmentations=augmentations,
                                        n_channels=n_channels)

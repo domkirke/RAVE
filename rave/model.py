@@ -208,7 +208,7 @@ class RAVE(pl.LightningModule):
         update_pca=True,
         gradient_clip_gen: Optional[float] = None,
         gradient_clip_dis: Optional[float] = None,
-        output_transforms: Optional[ad.transforms.AudioTransform] = None
+        output_transforms: Optional[ad.transforms.Transform] = None
     ):
         super().__init__()
         self.pqmf = pqmf(n_channels=n_channels) if pqmf is not None else None
@@ -839,7 +839,7 @@ class RAVE(pl.LightningModule):
         if self.trainer.state.stage == RunningStage.SANITY_CHECKING:
             return
 
-        audio = torch.cat(self.audio_val_buffer, 0)
+        audio = torch.stack(self.audio_val_buffer, 0)
         if isinstance(self.encoder, blocks.VariationalEncoder):
             if not (self.warmed_up and not self.no_freeze_when_warmed_up) and (self.update_pca):
                 z = torch.stack(self.latent_val_buffer, 0)
@@ -866,10 +866,10 @@ class RAVE(pl.LightningModule):
                         np.argmax(var > p).astype(np.float32),
                     )
 
-        y = audio.reshape(-1).numpy()
+        y = self._invert(audio).reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", self._invert(y), self.eval_number,
+        self.logger.experiment.add_audio("audio_val", y, self.eval_number,
                                         self.sr)
         self.eval_number += 1
         self.audio_val_buffer = []

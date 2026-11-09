@@ -1,0 +1,755 @@
+import torch
+import torch.nn.functional as F
+import math
+import re
+import cached_conv as cc
+import gin
+from types import MethodType
+import torch.fx
+import torch.nn as nn
+from .model import RAVE
+from typing import Optional, Tuple
+from . import prior
+from .resampler import Resampler
+import nn_tilde
+import random
+from . import blocks
+from .projections import RAVEProjection
+
+
+def get_random_hash(n=8):
+    return "".join([chr(random.randrange(97,122)) for i in range(n)])
+
+
+projection_call_pattern = "\tif {{ITERATION}} == projection_idx: return self.projection_list[{{ITERATION}}].forward(z, latent_size = latent_size)\n"
+
+inv_projection_call_pattern = "\tif {{ITERATION}} == projection_idx: return self.projection_list[{{ITERATION}}].inverse(z, latent_size = latent_size, temperature=temperature)\n"
+
+project_pattern = """
+import torch
+
+@torch.jit.export
+def project(self, z, projection_idx: int, latent_size: int | None = None):
+{{PROJECT_CALL:LOOP}}
+\traise ValueError("projection not valid: %s"%projection_idx)
+
+@torch.jit.export
+def project_inverse(self, z, projection_idx: int, latent_size: int | None = None, temperature: float | None = None):
+{{INVERSE_CALL:LOOP}}
+\traise ValueError("projection not valid: %s"%projection_idx)
+"""
+
+
+def _replace_placeholders(code, **kwargs):
+    for k, v in kwargs.items():
+        pattern = re.compile(r'\{\{%s(\:LOOP)?(\[\])?\}\}'%(k.upper()))
+        iterations = list(pattern.finditer(code))
+        while len(iterations) > 0:
+            start, end = iterations[0].start(), iterations[0].end()
+            if (iterations[0].groups()[0] or "").upper() == ":LOOP":
+                n = kwargs.get(f'_{k}_loop')
+                assert n is not None
+                code = code[:start] + _parse_code_loop_placeholder(v, n, **kwargs)  + code[end:]
+            elif iterations[0].groups()[1] == "[]":
+                assert kwargs.get('iteration') is not None
+                code = code[:start] + _parse_code_placeholder(v[int(kwargs['iteration'])]) + code[end:]
+            else:
+                code = code[:start] + _parse_code_placeholder(v) + code[end:]
+            iterations = list(pattern.finditer(code))
+    return code
+    
+def _parse_code_placeholder(v: str):
+    return str(v)
+def _parse_code_loop_placeholder(v: str, length: int, **values):
+    val=""
+    for i in range(length):
+        val += _replace_placeholders(v, iteration=i, **values)
+    return val
+
+def _import_defs_from_tmpfile(code, gl=None, lo=None, tmpdir="/tmp/torchbend/jit"):
+    gl = gl or globals() 
+    os.makedirs(tmpdir, exist_ok=True)
+    file = os.path.join(tmpdir, get_random_hash(n=32)+".py")
+    with open(file, 'w+') as f:
+        f.write(code)
+    lo = lo or {}
+    code_compiled = compile(code, file, 'exec')
+    exec(code_compiled, gl, lo)
+    return lo 
+
+
+
+class ProjectionRouter(nn.Module):
+    def __init__(self, projection_list):
+        super().__init__()
+        self.projection_list = projection_list
+        self._init_callbacks()
+
+    def __len__(self):
+        return len(self.projection_list)
+
+    def __getitem__(self, idx): 
+        return self.projection_list[idx]
+
+    def _init_callbacks(self):
+        codes = _replace_placeholders(project_pattern,
+                                      project_call=projection_call_pattern, _project_call_loop = len(self.projection_list), 
+                                      inverse_call=inv_projection_call_pattern, _inverse_call_loop = len(self.projection_list),)
+
+        funcs = _import_defs_from_tmpfile(codes, gl=globals(), lo=locals())
+        # globals()['project'] = funcs['project']
+        # globals()['project_inverse'] = funcs['project_inverse']
+        project = MethodType(funcs['project'], self)
+        project_inverse = MethodType(funcs['project_inverse'], self)
+        setattr(self, 'project', project)
+        setattr(self, 'project_inverse', project_inverse)
+
+    def append(self, projection: RAVEProjection):
+        self.projection_list.append(projection)
+        self._init_callbacks()
+
+    @torch.jit.export
+    def forward(self, z, projection_idx: int, latent_size: int | None = None):
+        return self.project(z, projection_idx, latent_size=latent_size)
+        
+    @torch.jit.export
+    def inverse(self, z, projection_idx: int, latent_size: int | None = None, temperature: float | None = None):
+        return self.project_inverse(z, projection_idx, latent_size=latent_size, temperature=temperature)
+
+
+torch.fx._symbolic_trace._wrapped_methods_to_patch.extend([(ProjectionRouter, "forward"), (ProjectionRouter, "inverse")])
+
+
+class DumbPQMF(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x
+    def inverse(self, x: torch.Tensor):
+        return x
+    
+class DumbPrior(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x
+
+class ScriptedRAVE(nn_tilde.Module):
+
+    def __init__(self,
+                 pretrained: RAVE,
+                 channels: Optional[int] = None,
+                 fidelity: float = .95,
+                 target_sr: bool = None, 
+                 prior: prior.Prior = None,
+                 latent_size: int = None) -> None:
+
+        super().__init__()
+        self.pqmf = pretrained.pqmf if pretrained.pqmf is not None else DumbPQMF()
+        self.sr = pretrained.sr
+        self.spectrogram = pretrained.spectrogram
+        self.resampler = None
+        self.input_mode = pretrained.input_mode
+        self.output_mode = pretrained.output_mode
+        self.n_channels = pretrained.n_channels
+        self.target_channels = channels or self.n_channels
+        self.stereo_mode = False
+
+        if target_sr is not None:
+            if target_sr != self.sr:
+                assert not target_sr % self.sr, "Incompatible target sampling rate"
+                self.resampler = Resampler(target_sr, self.sr)
+                self.sr = target_sr
+
+        self.full_latent_size = pretrained.latent_size
+        self.is_using_adain = False
+        for m in self.modules():
+            if isinstance(m, blocks.AdaptiveInstanceNormalization):
+                self.is_using_adain = True
+                break
+        if self.is_using_adain and (self.n_channels != self.target_channels):
+            raise ValueError("AdaIN requires the original number of channels")
+
+        self.register_attribute("learn_target", False)
+        self.register_attribute("reset_target", False)
+        self.register_attribute("learn_source", False)
+        self.register_attribute("reset_source", False)
+        self.register_attribute("temperature", 1.0)
+        receptive_field = getattr(pretrained, "receptive_field", None)
+        self.register_attribute("receptive_field", (int(receptive_field[0]), int(receptive_field[1])))
+
+        self.register_buffer("latent_pca", pretrained.latent_pca)
+        self.register_buffer("latent_mean", pretrained.latent_mean)
+        self.register_buffer("fidelity", pretrained.fidelity)
+
+        if latent_size is None:
+            if isinstance(pretrained.encoder, blocks.VariationalEncoder):
+                if fidelity is None:
+                    latent_size = self.full_latent_size
+                else:
+                    latent_size = max(
+                        np.argmax(pretrained.fidelity.numpy() > fidelity), 1)
+                    latent_size = 2**math.ceil(math.log2(latent_size))
+                    print("Latent size from PCA : ", latent_size)
+
+            elif isinstance(pretrained.encoder, blocks.DiscreteEncoder):
+                latent_size = pretrained.encoder.num_quantizers
+
+            elif isinstance(pretrained.encoder, blocks.WasserteinEncoder):
+                latent_size = pretrained.latent_size
+
+            elif isinstance(pretrained.encoder, blocks.SphericalEncoder):
+                latent_size = pretrained.latent_size - 1
+
+            else:
+                raise ValueError(
+                    f'Encoder type {pretrained.encoder.__class__.__name__} not supported'
+                )
+        else:
+            assert latent_size > 0, "latent_size must be positive."
+
+        self.latent_size = latent_size
+        self.fake_adain = blocks.AdaptiveInstanceNormalization(0)
+
+        # have to init cached conv before graphing
+        self.encoder = pretrained.encoder
+        self.decoder = pretrained.decoder
+        x_len = 2**14
+        x = torch.zeros(1, self.n_channels, x_len)
+        z = self.encode(x)
+        ratio_encode = x_len // z.shape[-1]
+
+        # configure encoder
+        if (pretrained.input_mode == "pqmf") or (pretrained.output_mode == "pqmf"):
+            # scripting fails if cached conv is not initialized
+            self.pqmf(torch.zeros(1, 1, x_len))
+
+        encode_shape = (pretrained.n_channels, 2**14) 
+
+        self.register_method(
+            "encode",
+            in_channels=self.n_channels,
+            in_ratio=1,
+            out_channels=self.latent_size,
+            out_ratio=ratio_encode,
+            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels+1)],
+            output_labels=[
+                f'(signal) Latent dimension {i + 1}'
+                for i in range(self.latent_size)
+            ],
+        )
+        self.register_method(
+            "decode",
+            in_channels=self.latent_size,
+            in_ratio=ratio_encode,
+            out_channels=self.target_channels,
+            out_ratio=1,
+            input_labels=[
+                f'(signal) Latent dimension {i+1}'
+                for i in range(self.latent_size)
+            ],
+            output_labels=['(signal) Channel %d'%d for d in range(1, self.target_channels+1)]
+        )
+
+        self.register_method(
+            "forward",
+            in_channels=self.n_channels,
+            in_ratio=1,
+            out_channels=self.target_channels,
+            out_ratio=1,
+            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels + 1)],
+            output_labels=['(signal) Channel %d'%d for d in range(1, self.target_channels+1)]
+        )
+
+        # init prior in case
+        self._has_prior = False
+        
+        if prior is not None:
+            self._has_prior = True
+            self.prior_module = prior
+            self.register_method(
+                "prior",
+                in_channels=1,
+                in_ratio=prior.ratio,
+                out_channels = self.latent_size,
+                out_ratio=prior.ratio
+            )
+        else:
+            self.prior_module = DumbPrior()
+
+    def post_process_latent(self, z):
+        raise NotImplementedError
+
+    def pre_process_latent(self, z):
+        raise NotImplementedError
+
+    def init_cache(self, x):
+        self.forward(x)
+        if self.pqmf is not None:
+            u = self.pqmf(x.reshape(-1, 1, x.shape[-1]))
+            v = self.pqmf.inverse(u)
+
+    def update_adain(self):
+        for m in self.modules():
+            if isinstance(m, blocks.AdaptiveInstanceNormalization):
+                m.learn_x.zero_()
+                m.learn_y.zero_()
+
+                if self.learn_target[0]:
+                    m.learn_y.add_(1)
+                if self.learn_source[0]:
+                    m.learn_x.add_(1)
+
+                if self.reset_target[0]:
+                    m.reset_y()
+                if self.reset_source[0]:
+                    m.reset_x()
+
+        self.reset_source = False,
+        self.reset_target = False,
+
+    @torch.jit.export
+    def set_stereo_mode(self, stereo):
+        self.stereo_mode = bool(stereo);
+
+
+    @torch.jit.export
+    def encode(self, x):
+        if self.stereo_mode:
+            if self.n_channels == 1:
+                x = x[:, 0].unsqueeze(0)
+            elif self.n_channels > 2:
+                raise RuntimeError("stereo mode is not available when n_channels > 2")
+
+        if self.is_using_adain:
+            self.update_adain()
+
+        if self.resampler is not None:
+            x = self.resampler.to_model_sampling_rate(x)
+
+        batch_size = x.shape[:-2]
+        if self.input_mode == "pqmf":
+            x = x.reshape(-1, 1, x.shape[-1])
+            x = self.pqmf(x)
+            x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
+        elif self.input_mode == "mel":
+            if self.spectrogram is not None:
+                x = self.spectrogram(x)[..., :-1]
+                x = torch.log1p(x).reshape(batch_size + (-1, x.shape[-1]))
+            else:
+                raise RuntimeError()
+        z = self.encoder(x)
+        z = self.post_process_latent(z)
+        return z
+
+
+    @torch.jit.export
+    def decode(self, z, from_forward: bool = False):
+        if self.is_using_adain and not from_forward:
+            self.update_adain()
+        n_batch = z.shape[0]
+        if self.stereo_mode:
+            n_batch = int(n_batch / 2)
+
+        if self.target_channels > self.n_channels:
+            z = z.repeat(math.ceil(self.target_channels / self.n_channels), 1, 1)[:self.target_channels]
+
+        z = self.pre_process_latent(z)
+        y = self.decoder(z)
+
+        batch_size = z.shape[:-2]
+        if self.output_mode == "pqmf":
+            y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
+            y = self.pqmf.inverse(y)
+            y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode=="complex_stft":
+            y = self.spectrogram.inverse(y)
+
+        if self.resampler is not None:
+            y = self.resampler.from_model_sampling_rate(y)
+
+        # if (output-) padding is scrambled
+        if y.shape[-1] > z.shape[-1] * self.decode_params[1]:
+            y = y[..., :z.shape[-1] * self.decode_params[1]]
+
+        if self.stereo_mode:
+            y = torch.cat([y[:n_batch], y[n_batch:]], 1)
+        elif self.target_channels > self.n_channels:
+            y = torch.cat(y.chunk(self.target_channels, 0), 1)
+        elif self.target_channels < self.n_channels:
+            y = y[:, :self.target_channels]
+        return y
+
+    @torch.jit.export
+    def decode_full(self, z, from_forward: bool = False):
+        n_batch = z.shape[0]
+        if self.stereo_mode:
+            n_batch = int(n_batch / 2)
+        z = self.pre_process_latent_full(z)
+        y = self.decoder(z)
+
+        batch_size = z.shape[:-2]
+        if self.output_mode == "pqmf":
+            y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
+            y = self.pqmf.inverse(y)
+            y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode=="complex_stft":
+            y = self.spectrogram.inverse(y)
+
+        if self.resampler is not None:
+            y = self.resampler.from_model_sampling_rate(y)
+
+        # if (output-) padding is scrambled
+        if y.shape[-1] > z.shape[-1] * self.decode_params[1]:
+            y = y[..., :z.shape[-1] * self.decode_params[1]]
+
+        if self.stereo_mode:
+            y = torch.cat([y[:n_batch], y[n_batch:]], 1)
+        elif self.target_channels > self.n_channels:
+            y = torch.cat(y.chunk(self.target_channels, 0), 1)
+        elif self.target_channels < self.n_channels:
+            y = y[:, :self.target_channels]
+        return y
+
+    def forward(self, x):
+        return self.decode(self.encode(x), from_forward=True)
+
+    @torch.jit.export
+    def get_learn_target(self) -> bool:
+        return self.learn_target[0]
+
+    @torch.jit.export
+    def set_learn_target(self, learn_target: bool) -> int:
+        self.learn_target = (learn_target, )
+        return 0
+
+    @torch.jit.export
+    def get_learn_source(self) -> bool:
+        return self.learn_source[0]
+
+    @torch.jit.export
+    def set_learn_source(self, learn_source: bool) -> int:
+        self.learn_source = (learn_source, )
+        return 0
+
+    @torch.jit.export
+    def get_reset_target(self) -> bool:
+        return self.reset_target[0]
+
+    @torch.jit.export
+    def set_reset_target(self, reset_target: bool) -> int:
+        self.reset_target = (reset_target, )
+        return 0
+
+    @torch.jit.export
+    def get_reset_source(self) -> bool:
+        return self.reset_source[0]
+
+    @torch.jit.export
+    def set_reset_source(self, reset_source: bool) -> int:
+        self.reset_source = (reset_source, )
+        return 0
+    
+    @torch.jit.export
+    def get_temperature(self) -> Tuple[float]:
+        return self.temperature
+
+    @torch.jit.export 
+    def set_temperature(self, temperature: float) -> int:
+        if temperature < 0: 
+            return -1
+        self.temperature = (temperature,)
+        return 0
+
+    @torch.jit.export
+    def get_receptive_field(self) -> Tuple[int, int]:
+        return self.receptive_field
+
+    @torch.jit.export 
+    def set_receptive_field(self, dimred: str) -> int:
+        return -1
+
+
+    @torch.jit.export
+    def prior(self, temp: torch.Tensor):
+        if self._has_prior:
+            return self.prior_module.forward(temp)
+        else:
+            return torch.tensor(0)
+        
+
+
+class VariationalScriptedRAVE(ScriptedRAVE):
+
+    def __init__(self, *args, use_pca=True, **kwargs):
+        self.use_pca = use_pca
+        super(VariationalScriptedRAVE, self).__init__(*args, **kwargs)
+        if self.use_pca:
+            assert self.latent_size <= self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+        self.register_method(
+            "encode_full",
+            in_channels=self.n_channels,
+            in_ratio=self.encode_params[1],
+            out_channels=self.full_latent_size,
+            out_ratio=self.encode_params[3],
+            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels+1)],
+            output_labels=[
+                f'(signal) Latent dimension {i + 1}'
+                for i in range(self.full_latent_size)
+            ],
+        )
+        self.register_method(
+            "decode_full",
+            in_channels=self.full_latent_size,
+            in_ratio=self.decode_params[1],
+            out_channels=self.target_channels,
+            out_ratio=self.decode_params[3],
+            input_labels=[
+                f'(signal) Latent dimension {i+1}'
+                for i in range(self.full_latent_size)
+            ],
+            output_labels=['(signal) Channel %d'%d for d in range(1, self.target_channels+1)]
+        )
+        self.register_method(
+            "encode_dist",
+            in_channels=self.n_channels,
+            in_ratio=self.encode_params[1],
+            out_channels=self.latent_size * 2,
+            out_ratio=self.encode_params[3],
+            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels+1)],
+            output_labels=[
+                f'(signal) Latent mean {i + 1}'
+                for i in range(self.latent_size)
+            ] + [
+                f'(signal) Latent std {i + 1}'
+                for i in range(self.latent_size)
+            ],
+        )
+    
+    @torch.jit.export
+    def encode_full(self, x):
+        if self.stereo_mode:
+            if self.n_channels == 1:
+                x = x[:, 0].unsqueeze(0)
+            elif self.n_channels > 2:
+                raise RuntimeError("stereo mode is not available when n_channels > 2")
+
+        if self.is_using_adain:
+            self.update_adain()
+
+        if self.resampler is not None:
+            x = self.resampler.to_model_sampling_rate(x)
+
+        batch_size = x.shape[:-2]
+        if self.input_mode == "pqmf":
+            x = x.reshape(-1, 1, x.shape[-1])
+            x = self.pqmf(x)
+            x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
+        elif self.input_mode == "mel":
+            if self.spectrogram is not None:
+                x = self.spectrogram(x)[..., :-1]
+                x = torch.log1p(x).reshape(batch_size + (-1, x.shape[-1]))
+            else:
+                raise RuntimeError()
+            
+        print(x.shape)
+        z = self.encoder(x)
+        z = self.post_process_latent_full(z)
+        return z
+
+    @torch.jit.export
+    def encode_dist(self, x):
+        if self.stereo_mode:
+            if self.n_channels == 1:
+                x = x[:, 0].unsqueeze(0)
+            elif self.n_channels > 2:
+                raise RuntimeError("stereo mode is not available when n_channels > 2")
+
+        if self.is_using_adain:
+            self.update_adain()
+
+        if self.resampler is not None:
+            x = self.resampler.to_model_sampling_rate(x)
+
+        batch_size = x.shape[:-2]
+        if self.input_mode == "pqmf":
+            x = x.reshape(-1, 1, x.shape[-1])
+            x = self.pqmf(x)
+            x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
+        elif self.input_mode == "mel":
+            if self.spectrogram is not None:
+                x = self.spectrogram(x)[..., :-1]
+                x = torch.log1p(x).reshape(batch_size + (-1, x.shape[-1]))
+            else:
+                raise RuntimeError()
+        z = self.encoder(x)
+
+        # parse mean and scale
+        z, scale = z.chunk(2, 1)
+        std = nn.functional.softplus(scale) + 1e-4
+        z = z - self.latent_mean.unsqueeze(-1)
+        z = F.conv1d(z, self.latent_pca.unsqueeze(-1))
+        z = z[:, :self.latent_size]
+        std = F.conv1d(std*std, self.latent_pca.unsqueeze(-1).pow(2)).sqrt()
+        std = std[:, :self.latent_size]
+        return torch.cat([z, std], dim=-2)
+
+    def post_process_latent(self, z):
+        z = self.encoder.reparametrize(z, temperature=self.temperature[0])[0]
+        if self.use_pca:
+            z = z - self.latent_mean.unsqueeze(-1)
+            z = F.conv1d(z, self.latent_pca.unsqueeze(-1))
+        z = z[:, :self.latent_size]
+        return z
+       
+    def post_process_latent_full(self, z):
+        z = self.encoder.reparametrize(z, temperature=self.temperature[0])[0]
+        if self.use_pca:
+            z = z - self.latent_mean.unsqueeze(-1)
+            z = F.conv1d(z, self.latent_pca.unsqueeze(-1))
+        return z
+ 
+    def pre_process_latent(self, z):
+        if z.shape[1] < self.full_latent_size:
+            noise = torch.randn(
+                z.shape[0],
+                self.full_latent_size - z.shape[1],
+                z.shape[-1],
+            ).type_as(z)
+            z = torch.cat([z, noise * self.temperature[0]], 1)
+        if self.use_pca:
+            z = F.conv1d(z, self.latent_pca.T.unsqueeze(-1))
+            z = z + self.latent_mean.unsqueeze(-1)
+        return z
+
+    def pre_process_latent_full(self, z):
+        if self.use_pca:
+            z = F.conv1d(z, self.latent_pca.T.unsqueeze(-1))
+            z = z + self.latent_mean.unsqueeze(-1)
+        return z
+
+
+class DiscreteScriptedRAVE(ScriptedRAVE):
+
+    def __init__(self, *args, **kwargs):
+        super(DiscreteScriptedRAVE, self).__init__(*args,**kwargs)
+        assert self.latent_size < self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+
+    def post_process_latent(self, z):
+        z = self.encoder.rvq.encode(z)
+        return z.float()
+
+    def pre_process_latent(self, z):
+        z = torch.clamp(z, 0,
+                        self.encoder.rvq.layers[0].codebook_size - 1).long()
+        z = self.encoder.rvq.decode(z)
+        if self.encoder.noise_augmentation:
+            noise = torch.randn(z.shape[0], self.encoder.noise_augmentation,
+                                z.shape[-1]).type_as(z)
+            z = torch.cat([z, noise], 1)
+        return z
+
+
+class WasserteinScriptedRAVE(ScriptedRAVE):
+
+    def __init__(self, *args, **kwargs):
+        super(WasserteinScriptedRAVE, self).__init__(*args,**kwargs)
+        assert self.latent_size < self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+
+    def post_process_latent(self, z):
+        return z
+
+    def pre_process_latent(self, z):
+        if self.encoder.noise_augmentation:
+            noise = torch.randn(z.shape[0], self.encoder.noise_augmentation,
+                                z.shape[-1]).type_as(z)
+            z = torch.cat([z, noise], 1)
+        return z
+
+
+class SphericalScriptedRAVE(ScriptedRAVE):
+
+    def __init__(self, *args, **kwargs):
+        super(SphericalScriptedRAVE, self).__init__(*args,**kwargs)
+        assert self.latent_size < self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+
+    def post_process_latent(self, z):
+        return blocks.unit_norm_vector_to_angles(z)
+
+    def pre_process_latent(self, z):
+        return blocks.angles_to_unit_norm_vector(z)
+
+
+class TraceModel(nn.Module):
+    def __init__(self, pretrained: prior.Prior, model: RAVE):
+        super().__init__()
+        pretrained._jit_is_scripting = True
+        self.pretrained = pretrained
+        self.latent_size = pretrained.latent_size
+
+        x = torch.zeros(1, self.pretrained.n_channels, 2**14)
+        z = model.encode(x)
+        z = pretrained.post_process_latent(z)
+        self.ratio = x.shape[-1] // z.shape[-1]
+
+        # self.register_buffer(
+        #     "forward_params",
+        #     torch.tensor([1, self.ratio, self.latent_size, self.ratio]),
+        # )
+
+        self.pretrained.synth = None
+
+        self.register_buffer(
+            "previous_step",
+            self.pretrained.quantized_normal.encode(
+                torch.zeros(1, self.latent_size, 1)),
+        )
+
+        self.pre_diag_cache = cc.CachedPadding(self.latent_size - 1)
+        self.pre_diag_cache(z)
+        self.pre_diag_cache = torch.jit.script(self.pre_diag_cache)
+
+    def step_forward(self, temp):
+        # PREDICT NEXT STEP
+        x = self.pretrained.forward(self.previous_step)
+        x = x / temp
+        x = self.pretrained.post_process_prediction(x, argmax=False)
+        # self.previous_step.copy_(x.clone())
+        # self.previous_step = x.clone()
+
+        # DECODE AND SHIFT PREDICTION
+        x = self.pretrained.quantized_normal.decode(x)
+        x = self.pre_diag_cache(x)
+        x = self.pretrained.diagonal_shift.inverse(x)
+        return x
+
+    def forward(self, temp: torch.Tensor):
+        x = torch.zeros(
+            temp.shape[0],
+            self.latent_size,
+            temp.shape[-1],
+        ).to(temp)
+
+        temp = temp.mean(-1, keepdim=True)
+        temp = nn.functional.softplus(temp) / math.log(2)
+
+        for i in range(x.shape[-1]):
+            x[..., i:i + 1] = self.step_forward(temp)
+
+        return x
+
+
+prior_classes = ['VariationalPrior']
+def get_prior_class_from_config():
+    prior_class = None
+    for cl in prior_classes:
+        try:
+            gin.get_bindings(cl)
+            prior_class = cl
+        except:
+            pass
+    if prior_class is None:
+        raise RuntimeError('Could not retrive Prior class from gin config')
+    return prior_class
