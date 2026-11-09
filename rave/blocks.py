@@ -1106,18 +1106,20 @@ class Generator2D(nn.Module):
 
 class VariationalEncoder(nn.Module):
 
-    def __init__(self, encoder, beta: float = 1.0, n_channels=1, no_freeze_when_warmed_up=False):
+    def __init__(self, encoder, beta: float = 1.0, n_channels=1, no_freeze_when_warmed_up=False, varmode="softplus", minvar=1e-4):
         super().__init__()
         self.encoder = encoder(n_channels=n_channels)
         self.beta = beta
+        self.varmode = varmode
+        self.minvar = minvar
         self.register_buffer("warmed_up", torch.tensor(0))
         self.no_freeze_when_warmed_up = no_freeze_when_warmed_up
 
     def reparametrize(self, z, temperature: float = 1.):
         mean, scale = z.chunk(2, 1)
-        mean = mark_fn(mean, name="latent_mean")
-        std = nn.functional.softplus(scale) + 1e-4
-        std = mark_fn(std, name="latent_std")
+        mean = tb.mark(mean, name="latent_mean")
+        std = self.std_from_scale(scale)
+        std = tb.mark(std, name="latent_std")
         var = std * std
         logvar = torch.log(var)
 
@@ -1126,6 +1128,14 @@ class VariationalEncoder(nn.Module):
         z = mark_fn(z, name="latent")
 
         return z, self.beta * kl
+
+    def std_from_scale(self, scale):
+        if self.varmode == "softplus":
+            return nn.functional.softplus(scale) + self.minvar
+        elif self.varmode == "sigmoid":
+            return torch.clamp(nn.functional.sigmoid(scale - 2), self.minvar, None)
+        else:
+            raise ValueError('varmode %s not known'%self.varmode)
 
     def set_warmed_up(self, state: bool):
         state = torch.tensor(int(state), device=self.warmed_up.device)

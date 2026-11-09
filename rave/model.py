@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from einops import rearrange
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA, FastICA
 from pytorch_lightning.trainer.states import RunningStage
 
 
@@ -20,9 +20,8 @@ import rave.core
 
 from . import blocks
 
-MAX_LATENT_FOR_VALIDATION = 2000
+MAX_LATENT_FOR_VALIDATION = 20000
 MAX_AUDIO_FOR_LOGGING = 32
-
 
 _default_loss_weights = {
     'audio_distance': 1.,
@@ -247,6 +246,7 @@ class RAVE(pl.LightningModule):
         self.register_buffer("latent_pca", torch.eye(latent_size))
         self.register_buffer("latent_mean", torch.zeros(latent_size))
         self.register_buffer("fidelity", torch.zeros(latent_size))
+        self.projections = nn.ParameterDict()
 
         self.latent_size = latent_size
 
@@ -375,6 +375,13 @@ class RAVE(pl.LightningModule):
                 self.update_discriminator_every = 1
             optimizers.append({'optimizer': dis_opt})
             return tuple(optimizers)
+
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        projections_keys = filter(lambda x: x.startswith('projections.'), state_dict.keys())
+        for p in projections_keys:
+            proj_name = p.replace('projections.', '')
+            self.projections[proj_name] = state_dict[p].clone()
+        return super().load_state_dict(state_dict, strict, assign)
 
     def import_weights(self, weight_dict, strict=False):
         state_dict = self.state_dict()
@@ -792,13 +799,12 @@ class RAVE(pl.LightningModule):
 
     def on_validation_step(self, x, batch_idx):
         z = self.encode(x)
-        if isinstance(self.encoder, blocks.VariationalEncoder):
-            mean = torch.split(z, z.shape[1] // 2, 1)[0]
-        else:
-            mean = None
+        # if isinstance(self.encoder, blocks.VariationalEncoder):
+        #     mean = torch.split(z, z.shape[1] // 2, 1)[0]
+        # else:
+        #     mean = None
 
-        z = self.encoder.reparametrize(z)[0]
-        y = self.decode(z)
+        y = self.decode(self.encoder.reparametrize(z)[0])
 
         distance = self.audio_distance(x, y)
         full_distance = sum(distance.values())
@@ -806,7 +812,7 @@ class RAVE(pl.LightningModule):
         if self.trainer is not None:
             self.log('validation', full_distance)
 
-        return torch.cat([x, y], -1), mean
+        return torch.cat([x, y], -1), z
 
     def on_validation_batch_end(self, out, *args, **kwargs):
         if not self.receptive_field.sum():
@@ -834,46 +840,116 @@ class RAVE(pl.LightningModule):
         if remaining_audio > 0:
             self.audio_val_buffer.extend(audio[:remaining_audio])
 
+    def _compute_pca(self, z):
+        z = rearrange(z, "b c t -> (b t) c")
+        z_mean = z.mean(0)
+        z = z - z_mean
+        
+        pca = PCA(z.shape[-1]).fit(z)
+        components = pca.components_
+        components = torch.from_numpy(components)
+
+        var = pca.explained_variance_ / np.sum(pca.explained_variance_)
+        var = torch.from_numpy(np.cumsum(var))
+        return components, z_mean, var
+
+    def _compute_ipca(self, z):
+        z = rearrange(z, "b c t -> (b t) c")
+        z_mean = z.mean(0)
+        z = z - z_mean
+        
+        pca = IncrementalPCA(z.shape[-1]).fit(z)
+        components = pca.components_
+        components = torch.from_numpy(components)
+
+        var = pca.explained_variance_ / np.sum(pca.explained_variance_)
+        var = torch.from_numpy(np.cumsum(var))
+        return components, z_mean, var
+
+    def _compute_ica(self, z):
+        z = rearrange(z, "b c t -> (b t) c")
+        
+        pca = FastICA(z.shape[-1], whiten='unit-variance').fit(z)
+        components = pca.components_
+        mixing = pca.mixing_
+        mean = pca.mean_
+
+        components = torch.from_numpy(components)
+        mixing = torch.from_numpy(mixing)
+        whitening = torch.from_numpy(pca.whitening_)
+
+        return torch.stack([mean[None], components, mixing, whitening])
+
+
+    def _record_vintage_pca(self, z):
+        pca, mean, var = self._compute_pca(z)
+        self.latent_mean.copy_(mean.to(self.latent_mean))
+        self.latent_pca.copy_(pca.to(self.latent_pca))
+        self.fidelity.copy_(var.to(self.fidelity))
+
+    def _record_pca(self, latent_buffer, n_pcas=1):
+        latent_buffer = latent_buffer.split(self.trainer.val_dataloaders.batch_size, 0)
+        for i in range(min(n_pcas, len(latent_buffer))):
+            current_buffer_mean = latent_buffer[i][:, :latent_buffer[i].shape[1] // 2]
+            pca, mean, var = self._compute_pca(current_buffer_mean)
+            self.projections['pca_%d'%i] = torch.cat([mean[None], var[None], pca], 0).cpu()
+        latent_full = torch.cat(latent_buffer, 0)
+        # record full pca from means
+        pca, mean, var = self._compute_pca(latent_full[:, :latent_full.shape[1] // 2])
+        self.projections['pca_full_mean'] = torch.cat([mean[None], var[None], pca], 0).cpu()
+        # record full sampled pca
+        pca, mean, var = self._compute_pca(self.encoder.reparametrize(latent_full)[0])
+        self.projections['pca_full_sampled'] = torch.cat([mean[None], var[None], pca], 0).cpu()
+        # record IPCA from mean
+        pca, mean, var = self._compute_ipca(latent_full[:, :latent_full.shape[1] // 2])
+        self.projections['ipca'] = torch.cat([mean[None], var[None], pca], 0).cpu()
+        # record ICA from mean
+        ica = self._compute_ica(latent_full[:, :latent_full.shape[1] // 2])
+        self.projections['ica'] = ica
+
+    def _log_fidelity(self, var, name, percent = [.8, .9, .95, .99]):
+        for p in percent:
+            self.log(
+                f"{name}_{p}",
+                np.argmax(var.cpu().numpy() > p).astype(np.float32)
+            )
+
     def on_validation_epoch_end(self):
 
         if self.trainer.state.stage == RunningStage.SANITY_CHECKING:
             return
 
-        audio = torch.stack(self.audio_val_buffer, 0)
+        audio = torch.cat(self.audio_val_buffer, 0)
         if isinstance(self.encoder, blocks.VariationalEncoder):
             if not (self.warmed_up and not self.no_freeze_when_warmed_up) and (self.update_pca):
-                z = torch.stack(self.latent_val_buffer, 0)
-                z = rearrange(z, "b c t -> (b t) c")
+                # "vintage" pca computation : perform on one batch, log fidelity
+                latent_buffer = torch.stack(self.latent_val_buffer, 0)
+                latent_buffer_sampled = self.encoder.reparametrize(latent_buffer)[0].split(self.trainer.val_dataloaders.batch_size, 0)
+                
+                z_batch = latent_buffer_sampled[0]
+                self._record_vintage_pca(z_batch)
+                self._log_fidelity(self.fidelity, "pca_1")
 
-                self.latent_mean.copy_(z.mean(0))
-                z = z - self.latent_mean.cpu()
+                # updated pca computation : perform differnt pca on several batches, and on full valid examples
+                self._record_pca(latent_buffer)
+                self._log_fidelity(self.projections['pca_full_mean'][1], "pca_%d_mean"%MAX_LATENT_FOR_VALIDATION)
+                self._log_fidelity(self.projections['pca_full_sampled'][1], "pca_%d_sampled"%MAX_LATENT_FOR_VALIDATION)
 
-                pca = PCA(z.shape[-1]).fit(z)
-
-                components = pca.components_
-                components = torch.from_numpy(components).to(self.latent_mean)
-                self.latent_pca.copy_(components)
-
-                var = pca.explained_variance_ / np.sum(pca.explained_variance_)
-                var = np.cumsum(var)
-
-                self.fidelity.copy_(torch.from_numpy(var).to(self.fidelity))
-
-                var_percent = [.8, .9, .95, .99]
-                for p in var_percent:
-                    self.log(
-                        f"fidelity_{p}",
-                        np.argmax(var > p).astype(np.float32),
-                    )
+                z_full = torch.stack(self.latent_val_buffer, 0)
+                z_mean, z_std = z_full.split(z_full.shape[1] // 2, -2)
+                self.logger.experiment.add_histogram("latent_mean_val", z_mean.flatten(), self.eval_number)
+                self.logger.experiment.add_histogram("latent_std_val", self.encoder.std_from_scale(z_std).flatten(), self.eval_number)
+                #z = torch.cat(z, 0)
+                
 
         y = self._invert(audio).reshape(-1).numpy()
         if self.integrator is not None:
             y = self.integrator(y)
-        self.logger.experiment.add_audio("audio_val", y, self.eval_number,
-                                        self.sr)
+        self.logger.experiment.add_audio("audio_val", y, self.eval_number, self.sr)
         self.eval_number += 1
         self.audio_val_buffer = []
         self.latent_val_buffer = []
+
 
     def on_fit_start(self):
         tb = self.logger.experiment
