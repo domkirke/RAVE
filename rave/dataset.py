@@ -141,7 +141,7 @@ _augmentations = []
 def parse_transform(transform):
     global _augmentations
     if isinstance(transform, type): 
-        transform = transform(sr=gin.config._CONSTANTS['SAMPLE_RATE'])
+        transform = transform(sr=gin.query_parameter('%SAMPLING_RATE'))
     _augmentations.append(transform)
 
 def get_augmentations():
