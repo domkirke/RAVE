@@ -140,7 +140,9 @@ _augmentations = []
 @gin.configurable(module="transforms")
 def parse_transform(transform):
     global _augmentations
-    _augmentations.append(transform(sr=gin.config._CONSTANTS['SAMPLE_RATE']))
+    if isinstance(transform, type): 
+        transform = transform(sr=gin.config._CONSTANTS['SAMPLE_RATE'])
+    _augmentations.append(transform)
 
 def get_augmentations():
     return _augmentations
