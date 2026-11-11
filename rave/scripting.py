@@ -963,18 +963,26 @@ def _export_dataset(db_path, model, partition="all", run_name=None, chunk_length
 def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper=False,
                                 fidelity=.95, latent_size=None, no_pca=False, ema_weights=False,
                                 ckpt_name="last.ckpt", max_chunks=None, batch_size=8,
-                                chunk_length=2**17, device="cpu", mapper_steps=5000) -> dict:
+                                chunk_length=2**17, device="cpu", mapper_steps=5000,
+                                sfa=False, pls=False, cca=False, descriptors=None,
+                                pitch_mode="pyin") -> dict:
     """encodes a dataset with a (non-streaming) RAVE and computes, from its latents:
       * the default PCA (latent_mean, latent_pca, fidelity), on sampled latents as during
         training (variational models only);
       * if ica: an ICA on the PCA-whitened subspace of dimension latent_size;
-      * if mapper: a Mapper (MLP autoencoder) with a bottleneck of dimension latent_size.
-    ica / mapper require latent_size.
+      * if mapper: a Mapper (MLP autoencoder) with a bottleneck of dimension latent_size;
+      * if sfa: a slow feature analysis on the PCA-whitened subspace of dimension latent_size;
+      * if pls / cca: PLS / CCA with audio descriptors (default: all DESCRIPTORS; f0 tracked
+        with pitch_mode), with latent_size components (at most the number of descriptors
+        for cca; default: number of descriptors).
+    ica / mapper / sfa require latent_size.
     Returns {"buffers": {name: tensor}, "projections": {name: buffer},
              "extra_projections": {name: RAVEProjection}}."""
     from . import load_rave_checkpoint, get_run_name
-    if (ica or mapper) and latent_size is None:
-        raise ValueError("ica / mapper projections require an explicit latent_size")
+    if (ica or mapper or sfa) and latent_size is None:
+        raise ValueError("ica / mapper / sfa projections require an explicit latent_size")
+    desc_names = list(descriptors or DESCRIPTORS)
+    use_descriptors = pls or cca
     cached_state = cc.use_cached_conv.__globals__["USE_CACHED_CONV"]
     cc.use_cached_conv(False)
     try:
@@ -986,7 +994,9 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
         cc.use_cached_conv(cached_state)
     model.eval()
     dataset = _export_dataset(db_path, model, partition, get_run_name(model_path), chunk_length)
-    z = encode_dataset(model, dataset, batch_size, max_chunks, device, raw=True)
+    data = encode_dataset(model, dataset, batch_size, max_chunks, device, raw=True, extras=use_descriptors,
+                          pitch_mode=pitch_mode if "f0" in desc_names else None)
+    z = data["latents"] if use_descriptors else data
     out = {"buffers": {}, "projections": {}, "extra_projections": {}}
 
     if isinstance(model.encoder, blocks.VariationalEncoder):
@@ -1006,6 +1016,11 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
         if not worth:
             _log.warning("ICA does not look relevant for these latents; computing it anyway as requested")
         out["projections"]["ica"] = compute_ica(z_mean, n_components=k)
+    linear_types = [t for t, on in (("sfa", sfa), ("pls", pls), ("cca", cca)) if on]
+    if linear_types:
+        fit_data = {"latents": z_mean, "descriptors": data["descriptors"] if use_descriptors else None}
+        out["projections"].update(fit_projections(model, fit_data, "", linear_types, dims=k,
+                                                  descriptors=desc_names))
     if mapper:
         _log.info(f"training mapper {z_mean.shape[1]} -> {k} -> {z_mean.shape[1]}")
         mapper_proj = train_mapper(z_mean, k, steps=mapper_steps, device=device, name="mapper", log=_log.info)
@@ -1018,7 +1033,8 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
 def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_size=None,
            no_pca=False, ema_weights=False, sr=None, prior=None, use_causal_stft=True,
            ckpt_name="last.ckpt", db_path=None, db_partition="all", ica=False, mapper=False,
-           max_chunks=None, device="cpu", mapper_steps=5000) -> str:
+           max_chunks=None, device="cpu", mapper_steps=5000, sfa=False, pls=False, cca=False,
+           descriptors=None, pitch_mode="pyin") -> str:
     """Scripts a RAVE run / checkpoint into a .ts file usable with nn~ and the RAVE VST.
 
     Args:
@@ -1041,22 +1057,29 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
             latent_size (requires db_path and latent_size).
         mapper: add a Mapper projection ("mapper"), MLP autoencoder with a bottleneck of
             dimension latent_size (requires db_path and latent_size).
+        sfa: add a slow feature analysis projection ("sfa") on the PCA-whitened subspace of
+            dimension latent_size (requires db_path and latent_size).
+        pls, cca: add PLS / CCA projections ("pls", "cca") aligned with audio descriptors
+            (requires db_path).
+        descriptors: descriptors used by pls / cca (default: all, see projections.DESCRIPTORS).
+        pitch_mode: acids_dataset F0 tracker of the f0 descriptor (only run if f0 is used).
         max_chunks, device: dataset encoding parameters; mapper_steps: mapper training steps.
 
     Returns:
         path of the exported .ts.
     """
     from . import load_rave_checkpoint, get_run_name
-    if (ica or mapper) and db_path is None:
-        raise ValueError("ica / mapper projections require a dataset (db_path)")
-    if (ica or mapper) and latent_size is None:
-        raise ValueError("ica / mapper projections require an explicit latent_size")
+    if (ica or mapper or sfa or pls or cca) and db_path is None:
+        raise ValueError("ica / mapper / sfa / pls / cca projections require a dataset (db_path)")
+    if (ica or mapper or sfa) and latent_size is None:
+        raise ValueError("ica / mapper / sfa projections require an explicit latent_size")
     dataset_projections = None
     if db_path is not None:
         dataset_projections = compute_dataset_projections(
             run, db_path, db_partition, ica=ica, mapper=mapper, fidelity=fidelity, latent_size=latent_size,
             no_pca=no_pca, ema_weights=ema_weights, ckpt_name=ckpt_name, max_chunks=max_chunks,
-            device=device, mapper_steps=mapper_steps)
+            device=device, mapper_steps=mapper_steps, sfa=sfa, pls=pls, cca=cca, descriptors=descriptors,
+            pitch_mode=pitch_mode)
     from . import core
     cached_state = cc.use_cached_conv.__globals__["USE_CACHED_CONV"]
     cc.use_cached_conv(streaming)
@@ -1165,6 +1188,8 @@ SUPERVISED_PROJECTIONS = {"pls": "descriptors", "cca": "descriptors", "lda": "la
 def projection_key(name: str, projection_type: str) -> str:
     if projection_type not in PROJECTION_TYPES:
         raise ValueError(f"unknown projection type {projection_type}; available: {list(PROJECTION_TYPES)}")
+    if not name:  # unnamed projections (e.g. computed at export) are named by their type
+        return projection_type
     return PROJECTION_TYPES[projection_type][0].format(name=name)
 
 
@@ -1232,11 +1257,13 @@ def _item_paths(dataset, indices) -> list:
 
 @torch.no_grad()
 def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Optional[int] = None,
-                   device: str = "cpu", raw: bool = False, extras: bool = False, pitch_mode: str = "pyin"):
+                   device: str = "cpu", raw: bool = False, extras: bool = False, pitch_mode: str = "pyin",
+                   progress: bool = True):
     """encodes a dataset of audio chunks with the RAVE encoder; returns a (n_chunks,
     latent, time) tensor of posterior means for variational models (raw encoder outputs
     if raw). If extras, returns {"latents", "descriptors" (n_chunks, len(DESCRIPTORS),
-    time), "paths" (audio file of each chunk)}."""
+    time), "paths" (audio file of each chunk)}. Shows a progress bar if progress."""
+    from tqdm import tqdm
     if isinstance(model.encoder, blocks.DiscreteEncoder):
         raise ValueError("latent projections are not supported for discrete models")
     n_items = len(dataset) if max_chunks is None else min(len(dataset), max_chunks)
@@ -1250,7 +1277,10 @@ def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Option
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model = model.to(device).eval()
     latents, descriptors = [], []
+    bar = tqdm(total=n_items, desc="encoding" + (" (+ descriptors)" if extras else ""), unit="chunk",
+               disable=not progress, dynamic_ncols=True)
     for x in loader:
+        bar.update(x.shape[0])
         x = x.to(device).float()
         if x.ndim == 2:
             x = x[:, None]
@@ -1260,6 +1290,7 @@ def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Option
         latents.append(z.cpu())
         if extras:
             descriptors.append(compute_descriptors(x, model.sr, z.shape[-1], pitch_mode=pitch_mode).cpu())
+    bar.close()
     model.cpu()
     latents = torch.cat(latents, 0).double()
     if not extras:

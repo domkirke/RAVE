@@ -470,7 +470,8 @@ def compute_f0(x: torch.Tensor, sr: int, n_frames: int, mode: str = "pyin",
 def compute_descriptors(x: torch.Tensor, sr: int, n_frames: int, pitch_mode: str = "pyin") -> torch.Tensor:
     """descriptors of audio x (b, channels, samples) on n_frames frames aligned with the
     latent frames: loudness (dB), log spectral centroid / bandwidth (log Hz), spectral
-    flatness, f0 (continuous, log scale in semitones, NaN when unvoiced; see compute_f0).
+    flatness, f0 (continuous, log scale in semitones, NaN when unvoiced; see compute_f0;
+    not computed, i.e. NaN, if pitch_mode is None).
     Returns (b, len(DESCRIPTORS), n_frames)."""
     x_mono = x.float().mean(1)
     hop = max(x_mono.shape[-1] // n_frames, 1)
@@ -487,7 +488,10 @@ def compute_descriptors(x: torch.Tensor, sr: int, n_frames: int, pitch_mode: str
     out = torch.stack([loudness, torch.log(centroid + 1), torch.log(bandwidth + 1), flatness], 1)
     if out.shape[-1] < n_frames:
         out = F.pad(out, (0, n_frames - out.shape[-1]), mode="replicate")
-    f0 = compute_f0(x, sr, n_frames, mode=pitch_mode).to(out)
+    if pitch_mode is None:  # f0 not computed (undefined)
+        f0 = torch.full_like(out[:, 0], float("nan"))
+    else:
+        f0 = compute_f0(x, sr, n_frames, mode=pitch_mode).to(out)
     return torch.cat([out, f0[:, None]], 1)
 
 

@@ -66,6 +66,14 @@ flags.DEFINE_enum('db_partition', 'all', ['all', 'train', 'val'],
                   help='part of the dataset used with --db_path (all = train + val)')
 flags.DEFINE_bool('ica', default=False, help='add an ICA projection computed on --db_path, on --latent_size whitened PCA components (requires --latent_size)')
 flags.DEFINE_bool('mapper', default=False, help='add a Mapper projection (MLP autoencoder, bottleneck of --latent_size) trained on --db_path (requires --latent_size)')
+flags.DEFINE_bool('sfa', default=False, help='add a slow feature analysis projection computed on --db_path, on '
+                  '--latent_size whitened PCA components (requires --latent_size)')
+flags.DEFINE_bool('pls', default=False, help='add a PLS projection aligned with audio --descriptors, computed on --db_path')
+flags.DEFINE_bool('cca', default=False, help='add a CCA projection aligned with audio --descriptors, computed on --db_path')
+flags.DEFINE_multi_enum('descriptors', None, ['loudness', 'centroid', 'bandwidth', 'flatness', 'f0'],
+                        help='--pls / --cca: audio descriptors (default: all)')
+flags.DEFINE_string('pitch_mode', default='pyin', help='--pls / --cca: acids_dataset F0 tracker for the f0 descriptor '
+                    '(pyin, yin, and crepe / pesto / world / praat if installed)')
 flags.DEFINE_integer('max_chunks', default=None, help='maximum number of dataset chunks encoded (random subset)')
 flags.DEFINE_string('device', default='cpu', help='device used to encode the dataset / train the mapper')
 flags.DEFINE_integer('mapper_steps', default=5000, help='mapper training steps')
@@ -93,7 +101,12 @@ def main(argv):
            mapper=FLAGS.mapper,
            max_chunks=FLAGS.max_chunks,
            device=FLAGS.device,
-           mapper_steps=FLAGS.mapper_steps)
+           mapper_steps=FLAGS.mapper_steps,
+           sfa=FLAGS.sfa,
+           pls=FLAGS.pls,
+           cca=FLAGS.cca,
+           descriptors=FLAGS.descriptors,
+           pitch_mode=FLAGS.pitch_mode)
 
 
 if __name__ == "__main__":
