@@ -18,13 +18,25 @@ models (--model):
   * .ts: the model is uncompiled to a temporary folder, edited, and re-exported with its
     original settings to --out, or replaces the original .ts after confirmation.
 
-projection types (stored as projections.<key> in the model):
-    pca   -> pca_<name>
-    ica   -> ica_<name>   (ICA on the PCA-whitened subspace of dimension --dims, or
-                           reaching --fidelity; remaining dims are principal components)
+projection types (stored as projections.<type>_<name> in the model):
+    pca    PCA
+    ica    ICA on the PCA-whitened subspace of dimension --dims (or reaching --fidelity)
+    wpca   whitened PCA (unit variance on every axis)
+    sfa    slow feature analysis: axes sorted from the slowest to the fastest, on the
+           PCA-whitened subspace of dimension --dims (or reaching --fidelity)
+    pls    partial least squares with audio --descriptors (default: all)
+    cca    canonical correlation analysis with audio --descriptors
+    lda    linear discriminant analysis between classes: one per --audio input, or the
+           first group of --label_regex on file paths
+  descriptors: loudness (dB), centroid / bandwidth (log Hz), flatness, f0 (continuous, log
+  scale in semitones, acids_dataset F0 tracker --pitch_mode; unvoiced frames are ignored
+  by pls / cca).
+  Linear projections are completed to invertible maps (remaining dims: principal
+  components); pls / lda axes are scaled to unit variance.
 
---fidelity / --dims set the ICA subspace, and the number of dimensions reported for PCA
-(PCA projections are stored full-size: their latent size is chosen at runtime).
+--fidelity / --dims set the ica / sfa subspace, the number of pls / cca / lda components
+(default: number of descriptors / classes - 1), and the number of dimensions reported for
+pca / wpca (stored full-size: their latent size is chosen at runtime).
 
 latent cache (add mode): with --cache, latents are stored in the package, in
     rave/.dimred_cache/<model_name>_<path_hash>/<version>/<name>/<id_hash>/
@@ -38,6 +50,7 @@ from pathlib import Path
 
 from absl import flags
 
+from rave.projections import DESCRIPTORS
 from rave.scripting import (PROJECTION_TYPES, add_projections, remove_projections, purge_latents_cache,
                             projection_key, latents_cache_size, format_size, LATENTS_CACHE_ROOT,
                             describe_projections, format_projections)
@@ -54,7 +67,14 @@ flags.DEFINE_multi_string("filter", [], help="add: glob-like pattern(s) selectin
                           "relative to each --audio folder (or file names), e.g. '*violin*', 'takes/*_close.wav'")
 flags.DEFINE_multi_string("exclude", [], help="add: glob-like pattern(s) of audio files to exclude")
 flags.DEFINE_multi_enum("type", ["pca"], list(PROJECTION_TYPES),
-                        help="projection type(s) (add default: pca; remove default: all types)")
+                        help="projection type(s): " + ", ".join(f"{k} ({v[1]})" for k, v in PROJECTION_TYPES.items())
+                        + " (add default: pca; remove default: all types)")
+flags.DEFINE_multi_enum("descriptors", None, list(DESCRIPTORS),
+                        help="pls / cca: audio descriptors to align with (default: all)")
+flags.DEFINE_string("pitch_mode", "pyin", help="pls / cca: acids_dataset F0 tracker used for the f0 descriptor "
+                    "(pyin, yin, and crepe / pesto / world / praat if installed)")
+flags.DEFINE_string("label_regex", None, help="lda: regular expression on audio file paths whose first group "
+                    "is the class label (default: one class per --audio input)")
 flags.DEFINE_string("out", None, help="output path (default: overwrite the input model)")
 flags.DEFINE_bool("yes", False, help="do not ask for confirmation before replacing a .ts")
 flags.DEFINE_integer("chunk_length", 2**17, help="length (samples) of encoded audio chunks")
@@ -126,7 +146,8 @@ def main(argv):
                               overwrite=True, chunk_length=FLAGS.chunk_length, batch_size=FLAGS.batch_size,
                               max_chunks=FLAGS.max_chunks, device=FLAGS.device, ckpt_name=FLAGS.ckpt_name,
                               dims=FLAGS.dims, fidelity=FLAGS.fidelity, cache=FLAGS.cache, force=FLAGS.force,
-                              filters=FLAGS.filter, exclude=FLAGS.exclude)
+                              filters=FLAGS.filter, exclude=FLAGS.exclude, descriptors=FLAGS.descriptors,
+                              label_regex=FLAGS.label_regex, pitch_mode=FLAGS.pitch_mode)
         print(f"\nprojections {keys} added to {out}")
         if FLAGS.cache:
             print(f"cache size: {format_size(latents_cache_size(model, ckpt_name=FLAGS.ckpt_name))} for this model, "

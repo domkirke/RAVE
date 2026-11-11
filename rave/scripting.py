@@ -209,8 +209,8 @@ class ScriptedRAVE(nn_tilde.Module):
             for k, v in pretrained.projections.items():
                 if k.startswith('pca'):
                     projection = PCAProjection.from_buffer(v, name=k)
-                elif k.startswith('ica'):
-                    projection = ICAProjection.from_buffer(v, name=k)
+                elif k.startswith(tuple(LINEAR_PROJECTION_PREFIXES)):
+                    projection = LinearProjection.from_buffer(v, name=k)
         #         elif k.startswith('mapper'):
         #             self.projections_types.append(2)
                 else: 
@@ -1272,14 +1272,14 @@ def transfer_weights(ts: torch.jit.ScriptModule, model: RAVE) -> RAVE:
         psd = proj.state_dict()
         if name.startswith("pca"):
             buf = torch.cat([psd["latent_mean"][None], psd["latent_var"][None], psd["components"]], 0)
-        elif name.startswith("ica"):
+        elif name.startswith(tuple(LINEAR_PROJECTION_PREFIXES)):
             try:
                 shape = psd["components"].shape
                 mean = psd["latent_mean"]
                 mean = mean[None].expand(shape) if mean.ndim == 1 else mean.reshape(shape)
                 buf = torch.stack([mean] + [psd[k] for k in ("components", "mixing", "whitening")])
             except RuntimeError:
-                _log.warning(f"could not rebuild ICA projection {name}; skipped")
+                _log.warning(f"could not rebuild linear projection {name}; skipped")
                 continue
         else:
             _log.warning(f"projection {name} cannot be inverted; skipped")
@@ -1837,9 +1837,15 @@ import shutil
 import tempfile
 
 PROJECTION_TYPES = {
-    "pca": ("pca_{name}", lambda model, z, **kw: model._compute_pca(z)),
-    "ica": ("ica_{name}", lambda model, z, **kw: compute_ica(z, **kw)),
+    "pca": ("pca_{name}", "PCA"),
+    "ica": ("ica_{name}", "ICA"),
+    "wpca": ("wpca_{name}", "whitened PCA"),
+    "sfa": ("sfa_{name}", "slow feature analysis"),
+    "pls": ("pls_{name}", "partial least squares (descriptors)"),
+    "cca": ("cca_{name}", "canonical correlation analysis (descriptors)"),
+    "lda": ("lda_{name}", "linear discriminant analysis (labels)"),
 }
+SUPERVISED_PROJECTIONS = {"pls": "descriptors", "cca": "descriptors", "lda": "labels"}
 
 
 def projection_key(name: str, projection_type: str) -> str:
@@ -1879,6 +1885,8 @@ def _audio_dataset(audio, sr, n_channels, chunk_length, filters=None, exclude=No
                 datasets.append(ad.datasets.AudioDataset(a, filters=filters, exclude=exclude, **kwargs))
             except RuntimeError as e:
                 _log.warning(f"no audio file selected in {a} ({e})")
+                continue
+        datasets[-1]._rave_input = str(a)  # fallback path of chunks (e.g. pre-processed datasets)
     files_by_dir = {}
     for f in (a for a in audio if a.is_file()):
         if _match_patterns(f.name, filters, exclude):
@@ -1892,23 +1900,42 @@ def _audio_dataset(audio, sr, n_channels, chunk_length, filters=None, exclude=No
     return datasets[0] if len(datasets) == 1 else torch.utils.data.ConcatDataset(datasets)
 
 
+def _item_paths(dataset, indices) -> list:
+    """audio file of each dataset item (None if unknown)."""
+    def path_of(ds, i):
+        if isinstance(ds, torch.utils.data.Subset):
+            return path_of(ds.dataset, ds.indices[i])
+        if isinstance(ds, torch.utils.data.ConcatDataset):
+            j = int(np.searchsorted(ds.cumulative_sizes, i, side="right"))
+            return path_of(ds.datasets[j], i - (ds.cumulative_sizes[j - 1] if j > 0 else 0))
+        try:
+            file = ds.files[ds.chunk_position(i, random_offset=False)[0]]
+            return file.get("path") or file.get("audio_path")
+        except Exception:
+            return getattr(ds, "_rave_input", None)
+    return [path_of(dataset, i) for i in indices]
+
+
 @torch.no_grad()
 def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Optional[int] = None,
-                   device: str = "cpu", raw: bool = False) -> torch.Tensor:
+                   device: str = "cpu", raw: bool = False, extras: bool = False, pitch_mode: str = "pyin"):
     """encodes a dataset of audio chunks with the RAVE encoder; returns a (n_chunks,
     latent, time) tensor of posterior means for variational models (raw encoder outputs
-    if raw)."""
+    if raw). If extras, returns {"latents", "descriptors" (n_chunks, len(DESCRIPTORS),
+    time), "paths" (audio file of each chunk)}."""
     if isinstance(model.encoder, blocks.DiscreteEncoder):
         raise ValueError("latent projections are not supported for discrete models")
     n_items = len(dataset) if max_chunks is None else min(len(dataset), max_chunks)
     if n_items == 0:
         raise RuntimeError("no audio chunk found")
+    indices = list(range(len(dataset)))
     if n_items < len(dataset):
-        dataset = torch.utils.data.Subset(dataset, torch.randperm(len(dataset))[:n_items].tolist())
+        indices = torch.randperm(len(dataset))[:n_items].tolist()
+        dataset = torch.utils.data.Subset(dataset, indices)
     _log.info(f"encoding {n_items} chunks")
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model = model.to(device).eval()
-    latents = []
+    latents, descriptors = [], []
     for x in loader:
         x = x.to(device).float()
         if x.ndim == 2:
@@ -1917,54 +1944,150 @@ def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Option
         if not raw and isinstance(model.encoder, blocks.VariationalEncoder):
             z = z.chunk(2, 1)[0]
         latents.append(z.cpu())
+        if extras:
+            descriptors.append(compute_descriptors(x, model.sr, z.shape[-1], pitch_mode=pitch_mode).cpu())
     model.cpu()
-    return torch.cat(latents, 0).double()
+    latents = torch.cat(latents, 0).double()
+    if not extras:
+        return latents
+    return {"latents": latents, "descriptors": torch.cat(descriptors, 0).double(),
+            "paths": _item_paths(dataset, range(len(dataset)))}
 
 
 def collect_latents(model: RAVE, audio, chunk_length: int = 2**17, batch_size: int = 8,
                     max_chunks: Optional[int] = None, device: str = "cpu",
-                    filters=None, exclude=None) -> torch.Tensor:
+                    filters=None, exclude=None, extras: bool = False, pitch_mode: str = "pyin"):
     """encodes audio (folders / files, selected with glob-like filters / exclude) with the
     RAVE encoder, and returns latents as a (n_chunks, latent_size, time) tensor (means for
-    variational models)."""
+    variational models), or {"latents", "descriptors", "paths"} if extras."""
     dataset = _audio_dataset(audio, model.sr, model.n_channels, chunk_length, filters, exclude)
-    return encode_dataset(model, dataset, batch_size, max_chunks, device)
+    return encode_dataset(model, dataset, batch_size, max_chunks, device, extras=extras, pitch_mode=pitch_mode)
 
 
-def fit_projections(model: RAVE, latents: torch.Tensor, name: str, types=("pca",),
-                    dims: Optional[int] = None, fidelity: float = .99) -> dict:
+def _log_axis_correlations(key, projected, targets, target_names, n_axes):
+    x = rearrange(projected[:, :n_axes].double(), "b c t -> (b t) c")
+    y = rearrange(targets.double(), "b c t -> (b t) c")
+    x = (x - x.mean(0)) / x.std(0).clamp_min(1e-12)
+    y = (y - y.mean(0)) / y.std(0).clamp_min(1e-12)
+    corr = (x.T @ y) / (len(x) - 1)
+    lines = [f"{key}: correlation of projected dimensions with descriptors",
+             "      " + "".join(f"{n:>11s}" for n in target_names)]
+    lines += [f"  {i:3d} " + "".join(f"{v:11.2f}" for v in corr[i].tolist()) for i in range(corr.shape[0])]
+    _log.info("\n".join(lines))
+
+
+def fit_projections(model: RAVE, data, name: str, types=("pca",), dims: Optional[int] = None,
+                    fidelity: float = .99, descriptors=None, labels=None) -> dict:
     """fits projections on latents, and registers them in model.projections.
-    dims (or the number of principal components reaching fidelity) is the dimension of
-    the PCA-whitened subspace for ICA, and is reported for PCA projections (stored full-size).
+
+    Args:
+        data: latents (b, c, t), or {"latents", "descriptors" (b, len(DESCRIPTORS), t)}.
+        types: among PROJECTION_TYPES.
+        dims, fidelity: number of dimensions (given, or number of principal components
+            reaching fidelity): whitened subspace for ica / sfa, number of components for
+            pls / cca / lda (default: number of descriptors / classes - 1), fitted
+            dimensions reported for pca / wpca. cca / lda use the subspace reaching fidelity.
+        descriptors: descriptor names used by pls / cca (default: all DESCRIPTORS).
+        labels: class label of each chunk (b,), used by lda.
     Returns {projection key: buffer}."""
-    ica_kwargs = dict(n_components=dims, fidelity=fidelity)
+    latents = data["latents"] if isinstance(data, dict) else data
+    desc_names = list(descriptors or DESCRIPTORS)
+    targets = None
+    if any(SUPERVISED_PROJECTIONS.get(t) == "descriptors" for t in types):
+        if not isinstance(data, dict) or data.get("descriptors") is None:
+            raise ValueError("pls / cca projections require descriptors")
+        unknown = set(desc_names) - set(DESCRIPTORS)
+        if unknown:
+            raise ValueError(f"unknown descriptors {unknown}; available: {DESCRIPTORS}")
+        targets = data["descriptors"][:, [DESCRIPTORS.index(d) for d in desc_names]]
+        # frames where a descriptor is undefined (e.g. f0 of unvoiced frames) are not used: frames
+        # are flattened as (frames, latent, 1) chunks
+        valid = torch.isfinite(targets).all(1)                                      # (b, t)
+        frame_latents = rearrange(latents, "b c t -> (b t) c")[valid.flatten()][..., None]
+        frame_targets = rearrange(targets, "b c t -> (b t) c")[valid.flatten()][..., None]
+        if valid.float().mean() < 1:
+            _log.info(f"pls / cca: {100 * (1 - valid.float().mean()):.1f}% of frames ignored "
+                      f"(undefined descriptors, e.g. f0 of unvoiced frames)")
+        if len(frame_latents) < latents.shape[1] + 2:
+            raise RuntimeError(f"not enough frames with defined descriptors ({len(frame_latents)}) "
+                               f"for a {latents.shape[1]}-dimensional latent space")
+        if len(frame_latents) < 10 * latents.shape[1]:
+            _log.warning(f"only {len(frame_latents)} frames with defined descriptors: pls / cca may be unreliable "
+                         "(use more audio, or other descriptors)")
     new = {}
     for t in types:
         key = projection_key(name, t)
-        _log.info(f"fitting {t} projection {key}")
-        if t == "ica":
-            worth, info = ica_relevance(latents, **ica_kwargs)
-            _log.info(f"ICA on {info['n_components']} whitened PCA components")
-            if not worth:
-                _log.warning(f"ICA does not look relevant for these latents ({info['reason']}); "
-                             "computing it anyway as requested")
-        out = PROJECTION_TYPES[t][1](model, latents, **(ica_kwargs if t == "ica" else {}))
+        _log.info(f"fitting {PROJECTION_TYPES[t][1]} projection {key}")
         if t == "pca":
-            components, mean, var = out
+            components, mean, var = model._compute_pca(latents)
             buf = torch.cat([mean[None], var[None], components], 0)
             if dims is None:
                 n = int(min(len(var), int(torch.searchsorted(var.double(), torch.tensor(float(fidelity)).double())) + 1))
                 _log.info(f"{key}: {n} dimensions reach a fidelity of {fidelity}")
             else:
                 _log.info(f"{key}: {dims} dimensions give a fidelity of {float(var[min(dims, len(var)) - 1]):.3f}")
+        elif t == "ica":
+            worth, info = ica_relevance(latents, n_components=dims, fidelity=fidelity)
+            _log.info(f"ICA on {info['n_components']} whitened PCA components")
+            if not worth:
+                _log.warning(f"ICA does not look relevant for these latents ({info['reason']}); "
+                             "computing it anyway as requested")
+            buf = compute_ica(latents, n_components=dims, fidelity=fidelity)
+        elif t == "wpca":
+            buf = compute_whitened_pca(latents, n_components=dims, fidelity=fidelity)
+        elif t == "sfa":
+            buf = compute_sfa(latents, n_components=dims, fidelity=fidelity)
+        elif t == "pls":
+            buf = compute_pls(frame_latents, frame_targets, n_components=dims)
+        elif t == "cca":
+            buf = compute_cca(frame_latents, frame_targets, n_components=dims, fidelity=fidelity)
+        elif t == "lda":
+            if labels is None:
+                raise ValueError("lda projections require class labels")
+            classes = sorted(set(labels))
+            _log.info(f"{key}: {len(classes)} classes {classes}")
+            buf = compute_lda(latents, labels, n_components=dims, fidelity=fidelity)
         else:
-            buf = out
+            raise ValueError(f"unknown projection type {t}")
         buf = buf.float().cpu()
+        if t != "pca":
+            info = linear_projection_info(buf)
+            _log.info(f"{key}: {info['n_fitted']} fitted dimensions, scores "
+                      f"{[round(v, 3) for v in info['scores'][:8]]}{' ...' if info['n_fitted'] > 8 else ''}")
+            if t in ("pls", "cca"):
+                projected = LinearProjection.from_buffer(buf)(frame_latents.float())
+                _log_axis_correlations(key, projected, frame_targets, desc_names, info["n_fitted"])
         if key in model.projections:
             _log.warning(f"projection {key} already exists: overwritten")
         model.projections[key] = nn.Parameter(buf, requires_grad=False)
         new[key] = buf
     return new
+
+
+def chunk_labels(paths, audio, label_regex: Optional[str] = None):
+    """class label of each chunk, from its audio file path: the --audio input it comes from
+    (default), or the first group (whole match if none) of label_regex. Chunks without
+    label are None."""
+    import re
+    if label_regex is not None:
+        pattern = re.compile(label_regex)
+        labels = []
+        for p in paths:
+            m = pattern.search(str(p)) if p is not None else None
+            labels.append((m.group(1) if m.groups() else m.group(0)) if m else None)
+        return labels
+    inputs = [Path(a).expanduser().resolve() for a in ([audio] if isinstance(audio, (str, Path)) else audio)]
+    labels = []
+    for p in paths:
+        label = None
+        if p is not None:
+            p = Path(p).resolve()
+            for a in inputs:
+                if p == a or a in p.parents:
+                    label = a.stem if a.is_file() else a.name
+                    break
+        labels.append(label)
+    return labels
 
 
 def _write_projections_to_ckpt(ckpt_path, projections: dict, out_path=None, remove=()):
@@ -2125,23 +2248,30 @@ def _encoder_fingerprint(model) -> list:
 
 
 def _load_latents_cache(cache_dir: Path, model):
-    latents_file, meta_file = cache_dir / "latents.pt", cache_dir / "meta.json"
-    if not (latents_file.exists() and meta_file.exists()):
+    latents_file, extras_file, meta_file = cache_dir / "latents.pt", cache_dir / "extras.pt", cache_dir / "meta.json"
+    if not (latents_file.exists() and extras_file.exists() and meta_file.exists()):
         return None
     meta = json.loads(meta_file.read_text())
     fp, cached_fp = np.array(_encoder_fingerprint(model)), np.array(meta.get("encoder_fingerprint", []))
     if fp.shape != cached_fp.shape or not np.allclose(fp, cached_fp, rtol=1e-3, atol=1e-6):
         _log.info(f"cache {cache_dir} was computed with other encoder weights: recomputing")
         return None
+    extras = torch.load(extras_file, map_location="cpu")
+    if list(extras.get("descriptor_names", [])) != list(DESCRIPTORS):
+        _log.info(f"cache {cache_dir} has other descriptors: recomputing")
+        return None
     _log.info(f"loading cached latents from {cache_dir}")
-    return torch.load(latents_file, map_location="cpu")
+    return {"latents": torch.load(latents_file, map_location="cpu"), "descriptors": extras["descriptors"],
+            "paths": extras["paths"]}
 
 
-def _save_latents_cache(cache_dir: Path, latents, model, audio, params):
+def _save_latents_cache(cache_dir: Path, data: dict, model, audio, params):
     cache_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(latents, cache_dir / "latents.pt")
+    torch.save(data["latents"], cache_dir / "latents.pt")
+    torch.save({"descriptors": data["descriptors"], "paths": data["paths"], "descriptor_names": list(DESCRIPTORS)},
+               cache_dir / "extras.pt")
     meta = {"audio": sorted(str(Path(a).expanduser().resolve()) for a in ([audio] if isinstance(audio, (str, Path)) else audio)),
-            "params": params, "shape": list(latents.shape),
+            "params": params, "shape": list(data["latents"].shape),
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "encoder_fingerprint": _encoder_fingerprint(model)}
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -2150,19 +2280,20 @@ def _save_latents_cache(cache_dir: Path, latents, model, audio, params):
 
 def get_latents(model, audio, cache_dir=None, force=False, chunk_length: int = 2**17,
                 batch_size: int = 8, max_chunks: Optional[int] = None, device: str = "cpu",
-                filters=None, exclude=None):
-    """latents of audio, loaded from cache_dir if valid (and not force), else computed
-    (and cached in cache_dir if given)."""
+                filters=None, exclude=None, pitch_mode: str = "pyin") -> dict:
+    """{"latents", "descriptors", "paths"} of audio, loaded from cache_dir if valid (and
+    not force), else computed (and cached in cache_dir if given)."""
     if cache_dir is not None and not force:
-        latents = _load_latents_cache(Path(cache_dir), model)
-        if latents is not None:
-            return latents
-    latents = collect_latents(model, audio, chunk_length, batch_size, max_chunks, device, filters, exclude)
+        data = _load_latents_cache(Path(cache_dir), model)
+        if data is not None:
+            return data
+    data = collect_latents(model, audio, chunk_length, batch_size, max_chunks, device, filters, exclude,
+                           extras=True, pitch_mode=pitch_mode)
     if cache_dir is not None:
         params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels,
-                      filters=list(filters or []), exclude=list(exclude or []))
-        _save_latents_cache(Path(cache_dir), latents, model, audio, params)
-    return latents
+                      filters=list(filters or []), exclude=list(exclude or []), pitch_mode=pitch_mode)
+        _save_latents_cache(Path(cache_dir), data, model, audio, params)
+    return data
 
 
 def latents_cache_size(model_path=None, root=None, ckpt_name="last.ckpt") -> int:
@@ -2208,7 +2339,8 @@ def add_projections(model_path, name: str, audio, types=("pca",), out=None, over
                     device: str = "cpu", ckpt_name: str = "last.ckpt",
                     dims: Optional[int] = None, fidelity: float = .99,
                     cache: bool = False, force: bool = False, cache_root=None,
-                    filters=None, exclude=None) -> str:
+                    filters=None, exclude=None, descriptors=None, label_regex: Optional[str] = None,
+                    pitch_mode: str = "pyin") -> str:
     """Computes custom latent projections of a RAVE model on a set of audio files, and
     writes them into the model.
 
@@ -2225,6 +2357,10 @@ def add_projections(model_path, name: str, audio, types=("pca",), out=None, over
         chunk_length, batch_size, max_chunks, device: encoding parameters.
         dims, fidelity: number of dimensions (given, or number of principal components
             reaching fidelity): PCA-whitened subspace for ICA, reported for PCA.
+        descriptors: descriptors used by pls / cca (default: all, see DESCRIPTORS).
+        pitch_mode: acids_dataset F0 tracker of the f0 descriptor (pyin, yin, crepe, ...).
+        label_regex: lda class labels: first group of this regular expression on audio file
+            paths (default: one class per audio input).
         cache: cache latents in {cache_root}/{model_name}_{path_hash}/{version}/{name}/{id_hash}
             (cache_root: rave/.dimred_cache), and load them from there if valid.
         force: recompute latents even if a valid cache exists (and re-write it).
@@ -2246,13 +2382,27 @@ def add_projections(model_path, name: str, audio, types=("pca",), out=None, over
         nonlocal cache_dir
         model = model_or_ckpt if isinstance(model_or_ckpt, RAVE) else _load_ckpt_model(model_or_ckpt)
         if cache:
-            params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels)
+            params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels,
+                          pitch_mode=pitch_mode)
             cache_dir = latents_cache_dir(model_path, name, audio, root=cache_root, ckpt_name=ckpt_name,
                                           filters=filters, exclude=exclude, **params)
-        latents = get_latents(model, audio, cache_dir=cache_dir, force=force, chunk_length=chunk_length,
-                              filters=filters, exclude=exclude,
-                              batch_size=batch_size, max_chunks=max_chunks, device=device)
-        return fit_projections(model, latents, name, types, dims, fidelity), []
+        data = get_latents(model, audio, cache_dir=cache_dir, force=force, chunk_length=chunk_length,
+                           filters=filters, exclude=exclude, pitch_mode=pitch_mode,
+                           batch_size=batch_size, max_chunks=max_chunks, device=device)
+        labels = None
+        if "lda" in types:
+            labels = chunk_labels(data["paths"], audio, label_regex)
+            keep = [i for i, l in enumerate(labels) if l is not None]
+            if len(keep) < len(labels):
+                _log.warning(f"{len(labels) - len(keep)} chunks without label are ignored by lda")
+            lda_data = {"latents": data["latents"][keep], "descriptors": data["descriptors"][keep]}
+            lda_proj = fit_projections(model, lda_data, name, ["lda"], dims, fidelity,
+                                       labels=[labels[i] for i in keep])
+        else:
+            lda_proj = {}
+        other = [t for t in types if t != "lda"]
+        projections = fit_projections(model, data, name, other, dims, fidelity, descriptors=descriptors) if other else {}
+        return {**projections, **lda_proj}, []
 
     out_path, added, _ = _edit_model_projections(model_path, edit, out, overwrite, ckpt_name)
     _log.info(f"projections {added} written to {out_path}")
@@ -2279,8 +2429,13 @@ def _describe_buffer(name, buf, latent_size=None) -> dict:
             info["fidelity_dims"] = {str(f): int(min(len(var), int((var > f).double().argmax()) + 1)) for f in (.9, .95, .99)}
         else:
             info["note"] = "fidelity not computed"
-    elif name.startswith("ica"):
-        info.update(type="ICA", input_dim=int(buf.shape[-1]), output_dim=int(buf.shape[-2]))
+    elif name.startswith(tuple(LINEAR_PROJECTION_PREFIXES)):
+        prefix = next(p for p in LINEAR_PROJECTION_PREFIXES if name.startswith(p))
+        info.update(type=LINEAR_PROJECTION_PREFIXES[prefix], input_dim=int(buf.shape[-1]), output_dim=int(buf.shape[-2]))
+        stored = linear_projection_info(buf)
+        if stored is not None:
+            info["n_fitted"] = stored["n_fitted"]
+            info["scores"] = stored["scores"]
     return info
 
 
@@ -2306,9 +2461,10 @@ def describe_projections(model_path, ckpt_name: str = "last.ckpt") -> dict:
             buf = torch.cat([proj.latent_mean[None], proj.latent_var[None], proj.components], 0)
             info = _describe_buffer("default" if i == 0 else name, buf)
             info["name"] = name
-        elif cls == "ICAProjection":
-            info = {"name": name, "type": "ICA", "input_dim": int(proj.components.shape[-1]),
-                    "output_dim": int(proj.components.shape[0])}
+        elif cls in ("ICAProjection", "LinearProjection"):
+            buf = torch.stack([proj.latent_mean[None].expand_as(proj.components), proj.components,
+                               proj.mixing, proj.whitening]) if proj.whitening.dim() == 2 else proj.components[None]
+            info = _describe_buffer(name, buf)
         elif cls == "MapperProjection":
             info = {"name": name, "type": "Mapper (MLP)", "input_dim": int(proj.input_size),
                     "output_dim": int(proj.output_size)}
@@ -2334,6 +2490,10 @@ def format_projections(description: dict) -> str:
             notes.append("dims for fidelity " + ", ".join(f"{k}: {v}" for k, v in p["fidelity_dims"].items()))
         if "note" in p:
             notes.append(p["note"])
+        if "n_fitted" in p:
+            label = {"ICA": "sources", "SFA": "slow features", "PLS": "components", "CCA": "canonical dims",
+                     "LDA": "discriminant dims", "whitened PCA": "dims at fidelity"}.get(p["type"], "fitted dims")
+            notes.append(f"{p['n_fitted']} {label}")
         if description.get("current") == p["name"]:
             notes.append("selected")
         rows.append((p["name"], p["type"], dims, "; ".join(notes)))

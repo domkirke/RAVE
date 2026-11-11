@@ -5,8 +5,13 @@ Builds .ts models holding every available latent projection, to try them in Max/
 
 Exported models contain the projections
     default          PCA of the model (recomputed on the dataset, export --db_path)
-    pca_<name>       PCA added with dimred
-    ica_<name>       ICA added with dimred (on --dims whitened components)
+    pca_<name>       PCA                                   \
+    ica_<name>       ICA (on latent_size whitened dims)     |
+    wpca_<name>      whitened PCA                           |
+    sfa_<name>       slow feature analysis                  |  added with dimred
+    pls_<name>       PLS with audio descriptors             |
+    cca_<name>       CCA with audio descriptors             |
+    lda_<name>       LDA, one class per audio folder       /
     ica              ICA added at export (on latent_size whitened components)
     mapper           Mapper (MLP autoencoder, bottleneck of latent_size) trained at export
 and are written, in offline and streaming versions, to $RAVE_TEST_OUT (default:
@@ -15,7 +20,8 @@ tests/outs/dimred).
 Environment variables:
     RAVE_TEST_MODEL     run folder / .ckpt (or .ts, uncompiled first) of a trained model
                         (default: an untrained model, only useful to test the patches)
-    RAVE_TEST_AUDIO     audio folder used to fit projections (default: tests/datasets/mono)
+    RAVE_TEST_AUDIO     audio folders used to fit projections, separated by ":" (one LDA class
+                        per folder; default: tests/datasets/mono:tests/datasets/stereo)
     RAVE_TEST_OUT       output folder (default: tests/outs/dimred)
     RAVE_TEST_LATENT    exported latent size (default: 8)
     RAVE_TEST_CHUNKS    maximum number of encoded audio chunks (default: 256)
@@ -31,16 +37,19 @@ import torch
 import cached_conv as cc
 
 import rave
-from rave.scripting import add_projections, export, list_projections, uncompile
+from rave.scripting import (add_projections, describe_projections, export, format_projections, list_projections,
+                            uncompile)
 
 TESTS_DIR = Path(__file__).parent
 NAME = "test"
 LATENT_SIZE = int(os.environ.get("RAVE_TEST_LATENT", 8))
 MAX_CHUNKS = int(os.environ.get("RAVE_TEST_CHUNKS", 256))
 DEVICE = os.environ.get("RAVE_TEST_DEVICE", "cpu")
-AUDIO = Path(os.environ.get("RAVE_TEST_AUDIO", TESTS_DIR / "datasets" / "mono"))
+AUDIO = [Path(a) for a in os.environ.get(
+    "RAVE_TEST_AUDIO", f"{TESTS_DIR / 'datasets' / 'mono'}:{TESTS_DIR / 'datasets' / 'stereo'}").split(":")]
+DIMRED_TYPES = ["pca", "ica", "wpca", "sfa", "pls", "cca", "lda"]
 OUT = Path(os.environ.get("RAVE_TEST_OUT", TESTS_DIR / "outs" / "dimred"))
-EXPECTED_PROJECTIONS = ["default", f"pca_{NAME}", f"ica_{NAME}", "ica", "mapper"]
+EXPECTED_PROJECTIONS = ["default"] + [f"{t}_{NAME}" for t in DIMRED_TYPES] + ["ica", "mapper"]
 
 
 def _untrained_run(path: Path) -> Path:
@@ -79,14 +88,14 @@ def exported_models(tmp_path_factory):
     tmp_path = tmp_path_factory.mktemp("dimred_export")
     run = _working_run(tmp_path)
     model_name = Path(os.environ.get("RAVE_TEST_MODEL", "untrained")).stem
-    # 1. dimred on the checkpoint: pca_<name> / ica_<name>
-    add_projections(run, NAME, [AUDIO], types=["pca", "ica"], dims=LATENT_SIZE,
+    # 1. dimred on the checkpoint: every dimred projection type
+    add_projections(run, NAME, AUDIO, types=DIMRED_TYPES, dims=LATENT_SIZE,
                     max_chunks=MAX_CHUNKS, device=DEVICE)
     # 2. export with dataset PCA, ica and mapper (after dimred: re-exporting a .ts drops the mapper)
     paths = {}
     for streaming in (False, True):
         paths[streaming] = export(run, out_path=OUT, name=f"{model_name}_projections", streaming=streaming,
-                                  latent_size=LATENT_SIZE, db_path=AUDIO, ica=True, mapper=True,
+                                  latent_size=LATENT_SIZE, db_path=AUDIO[0], ica=True, mapper=True,
                                   max_chunks=MAX_CHUNKS, device=DEVICE)
     return paths
 
@@ -109,6 +118,9 @@ def test_export_all_projections(exported_models, streaming):
         projected = ts.projections.forward(z, i, latent_size=LATENT_SIZE)
         assert projected.shape == (1, LATENT_SIZE, 32), (name, projected.shape)
         assert ts.projections.inverse(projected, i).shape == z.shape, name
+        if name != "mapper":  # linear projections are exactly invertible
+            full = ts.projections.forward(z, i)
+            assert torch.allclose(ts.projections.inverse(full, i), z, atol=1e-3), name
     assert ts.set_projection("default") == 0
 
     # offline model: audio round trip (streaming caches are only initialised by nn~)
@@ -116,4 +128,4 @@ def test_export_all_projections(exported_models, streaming):
         x = torch.randn(1, ts.n_channels, 2**15) * .1
         y = ts.decode(ts.encode(x))
         assert y.shape[-1] == x.shape[-1] and torch.isfinite(y).all()
-    print(f"\n{'streaming' if streaming else 'offline'} model with projections {names}: {path}")
+    print(f"\n{'streaming' if streaming else 'offline'} model: {path}\n{format_projections(describe_projections(path))}")
