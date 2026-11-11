@@ -982,8 +982,8 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
                                 sfa=False, pls=False, cca=False, descriptors=None,
                                 pitch_mode="pyin") -> dict:
     """encodes a dataset with a (non-streaming) RAVE and computes, from its latents:
-      * the default PCA (latent_mean, latent_pca, fidelity), on sampled latents as during
-        training (variational models only);
+      * the default PCA (latent_mean, latent_pca, fidelity), on posterior means (variational
+        models only);
       * if ica: an ICA on the PCA-whitened subspace of dimension latent_size;
       * if mapper: a Mapper (MLP autoencoder) with a bottleneck of dimension latent_size;
       * if sfa: a slow feature analysis on the PCA-whitened subspace of dimension latent_size;
@@ -1010,14 +1010,13 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
     model.eval()
     dataset = _export_dataset(db_path, model, partition, get_run_name(model_path), chunk_length)
     data = encode_dataset(model, dataset, batch_size, max_chunks, device, raw=True, extras=use_descriptors,
-                          pitch_mode=pitch_mode if "f0" in desc_names else None)
+                          descriptors=use_descriptors, pitch_mode=pitch_mode if "f0" in desc_names else None)
     z = data["latents"] if use_descriptors else data
     out = {"buffers": {}, "projections": {}, "extra_projections": {}}
 
     if isinstance(model.encoder, blocks.VariationalEncoder):
         z_mean = z.chunk(2, 1)[0]
-        z_sampled = model.encoder.reparametrize(z)[0]
-        components, mean, var = model._compute_pca(z_sampled)
+        components, mean, var = model._compute_pca(z_mean)  # PCA on posterior means
         out["buffers"] = {"latent_pca": components.float(), "latent_mean": mean.float(), "fidelity": var.float()}
         _log.info("dataset PCA fidelity: " + ", ".join(
             f"{p}: {int(np.argmax(var.numpy() > p))}" for p in (.8, .9, .95, .99)))
@@ -1217,20 +1216,95 @@ def _match_patterns(path: str, filters=None, exclude=None) -> bool:
     return not any(fnmatch.fnmatch(path, e) for e in (exclude or []))
 
 
+PARTITION_SEPARATOR = "->"
+
+
+def _as_list(audio) -> list:
+    return [audio] if isinstance(audio, (str, Path)) else list(audio)
+
+
+def parse_audio_input(audio_input):
+    """splits an --audio input "path[->[partition_file:]part]" into (resolved path, partition
+    file or None, part or None)."""
+    audio_input = str(audio_input)
+    if PARTITION_SEPARATOR not in audio_input:
+        return Path(audio_input).expanduser().resolve(), None, None
+    path, spec = audio_input.split(PARTITION_SEPARATOR, 1)
+    partition_file, part = spec.split(":", 1) if ":" in spec else (None, spec)
+    if not part:
+        raise ValueError(f"no partition given in {audio_input!r} (expected path->part or path->file:part)")
+    return Path(path).expanduser().resolve(), partition_file or None, part
+
+
+def _input_key(audio_input) -> str:
+    """normalized input identifier (resolved path, with its partition if any)."""
+    path, partition_file, part = parse_audio_input(audio_input)
+    if part is None:
+        return str(path)
+    return f"{path}{PARTITION_SEPARATOR}{partition_file + ':' if partition_file else ''}{part}"
+
+
+def _partition_files(db_path: Path) -> list:
+    folder = Path(db_path) / "partitions"
+    return sorted(f.stem for f in folder.glob("*.txt")) if folder.exists() else []
+
+
+def load_dataset_partition(db_path, part, partition_file=None, **kwargs):
+    """part of a partition of a pre-processed acids dataset. Without partition_file, the
+    part is searched in every partition file of the dataset (it must be found in exactly
+    one); "val" also matches the "test" part written by training splits."""
+    import acids_dataset as ad
+    db_path = Path(db_path)
+    if not db_path.is_dir() or not ad.is_preprocessed(str(db_path)):
+        raise ValueError(f"{db_path} is not a pre-processed acids dataset: partitions cannot be loaded "
+                         f"(syntax: /path/to/dataset{PARTITION_SEPARATOR}[file:]part)")
+    files = [partition_file] if partition_file else _partition_files(db_path)
+    if not files:
+        raise FileNotFoundError(f"no partition found in {db_path / 'partitions'}")
+    dataset = ad.datasets.AudioDataset(db_path, **kwargs)
+    candidates = []
+    for f in files:
+        if not dataset.has_partition(f):
+            raise FileNotFoundError(f"no partition file {f} in {db_path} (available: {_partition_files(db_path)})")
+        parts = dataset.load_partition(f)
+        name = part if part in parts else ("test" if part == "val" and "test" in parts else None)
+        if name is not None:
+            candidates.append((f, name, parts[name]))
+    if not candidates:
+        available = {f: list(dataset.load_partition(f).keys()) for f in files}
+        raise KeyError(f"no part {part!r} in partitions of {db_path} (available: {available})")
+    if len(candidates) > 1:
+        raise ValueError(f"part {part!r} found in several partition files {[c[0] for c in candidates]} of "
+                         f"{db_path}: use {db_path}{PARTITION_SEPARATOR}file:{part}")
+    f, name, subset = candidates[0]
+    _log.info(f"{db_path}: partition {f}, part {name} ({len(subset)} chunks)")
+    return subset
+
+
 def _audio_dataset(audio, sr, n_channels, chunk_length, filters=None, exclude=None):
     """AudioDataset over a list of audio folders and / or files. filters / exclude are
     glob-like patterns (e.g. "*violin*", "takes/*_close.wav"), matched against paths
     relative to each folder, or against names of single files. Single files are selected
-    in their parent folder with filters."""
+    in their parent folder with filters. A part of a partition of a pre-processed dataset
+    is given as /path/to/dataset->[file:]part (see load_dataset_partition)."""
     import glob
     import acids_dataset as ad
     filters, exclude = list(filters or []), list(exclude or [])
-    audio = [Path(a).expanduser().resolve() for a in ([audio] if isinstance(audio, (str, Path)) else audio)]
-    missing = [str(a) for a in audio if not a.exists()]
+    specs = [parse_audio_input(a) for a in _as_list(audio)]
+    missing = [str(p) for p, _, _ in specs if not p.exists()]
     if missing:
         raise FileNotFoundError(f"audio paths not found: {missing}")
     kwargs = dict(sr=sr, channels=n_channels, chunk_length=chunk_length, batch_by="dataset", write_index=False)
     datasets = []
+    for (path, partition_file, part), raw in zip(specs, _as_list(audio)):
+        if part is None:
+            continue
+        if filters or exclude:
+            _log.warning(f"{raw}: --filter / --exclude are ignored for dataset partitions")
+        subset = load_dataset_partition(path, part, partition_file, sr=sr, channels=n_channels)
+        subset._rave_input = _input_key(raw)  # path of its chunks (labels, cache)
+        datasets.append(subset)
+    audio = [path for path, _, part in specs if part is None]
     for a in (a for a in audio if a.is_dir()):
         if (filters or exclude) and ad.is_preprocessed(str(a)):
             _log.warning(f"{a} is a pre-processed dataset: --filter / --exclude are ignored for it")
@@ -1274,11 +1348,12 @@ def _item_paths(dataset, indices) -> list:
 @torch.no_grad()
 def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Optional[int] = None,
                    device: str = "cpu", raw: bool = False, extras: bool = False, pitch_mode: str = "pyin",
-                   progress: bool = True):
+                   progress: bool = True, descriptors: bool = True):
     """encodes a dataset of audio chunks with the RAVE encoder; returns a (n_chunks,
     latent, time) tensor of posterior means for variational models (raw encoder outputs
     if raw). If extras, returns {"latents", "descriptors" (n_chunks, len(DESCRIPTORS),
-    time), "paths" (audio file of each chunk)}. Shows a progress bar if progress."""
+    time; None if not descriptors; f0 only tracked if pitch_mode is not None), "paths" (audio
+    file of each chunk), "computed_descriptors" (names), "pitch_mode"}. Shows a progress bar if progress."""
     from tqdm import tqdm
     if isinstance(model.encoder, blocks.DiscreteEncoder):
         raise ValueError("latent projections are not supported for discrete models")
@@ -1292,8 +1367,9 @@ def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Option
     _log.info(f"encoding {n_items} chunks")
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model = model.to(device).eval()
-    latents, descriptors = [], []
-    bar = tqdm(total=n_items, desc="encoding" + (" (+ descriptors)" if extras else ""), unit="chunk",
+    latents, desc = [], []
+    with_descriptors = extras and descriptors
+    bar = tqdm(total=n_items, desc="encoding" + (" (+ descriptors)" if with_descriptors else ""), unit="chunk",
                disable=not progress, dynamic_ncols=True)
     for x in loader:
         bar.update(x.shape[0])
@@ -1304,25 +1380,29 @@ def encode_dataset(model: RAVE, dataset, batch_size: int = 8, max_chunks: Option
         if not raw and isinstance(model.encoder, blocks.VariationalEncoder):
             z = z.chunk(2, 1)[0]
         latents.append(z.cpu())
-        if extras:
-            descriptors.append(compute_descriptors(x, model.sr, z.shape[-1], pitch_mode=pitch_mode).cpu())
+        if with_descriptors:
+            desc.append(compute_descriptors(x, model.sr, z.shape[-1], pitch_mode=pitch_mode).cpu())
     bar.close()
     model.cpu()
     latents = torch.cat(latents, 0).double()
     if not extras:
         return latents
-    return {"latents": latents, "descriptors": torch.cat(descriptors, 0).double(),
+    computed = ([d for d in DESCRIPTORS if d != "f0" or pitch_mode is not None]) if with_descriptors else []
+    return {"latents": latents, "descriptors": torch.cat(desc, 0).double() if with_descriptors else None,
+            "computed_descriptors": computed, "pitch_mode": pitch_mode if "f0" in computed else None,
             "paths": _item_paths(dataset, range(len(dataset)))}
 
 
 def collect_latents(model: RAVE, audio, chunk_length: int = 2**17, batch_size: int = 8,
                     max_chunks: Optional[int] = None, device: str = "cpu",
-                    filters=None, exclude=None, extras: bool = False, pitch_mode: str = "pyin"):
+                    filters=None, exclude=None, extras: bool = False, pitch_mode: str = "pyin",
+                    descriptors: bool = True):
     """encodes audio (folders / files, selected with glob-like filters / exclude) with the
     RAVE encoder, and returns latents as a (n_chunks, latent_size, time) tensor (means for
     variational models), or {"latents", "descriptors", "paths"} if extras."""
     dataset = _audio_dataset(audio, model.sr, model.n_channels, chunk_length, filters, exclude)
-    return encode_dataset(model, dataset, batch_size, max_chunks, device, extras=extras, pitch_mode=pitch_mode)
+    return encode_dataset(model, dataset, batch_size, max_chunks, device, extras=extras, pitch_mode=pitch_mode,
+                          descriptors=descriptors)
 
 
 def _log_axis_correlations(key, projected, targets, target_names, n_axes):
@@ -1437,14 +1517,19 @@ def chunk_labels(paths, audio, label_regex: Optional[str] = None):
             m = pattern.search(str(p)) if p is not None else None
             labels.append((m.group(1) if m.groups() else m.group(0)) if m else None)
         return labels
-    inputs = [Path(a).expanduser().resolve() for a in ([audio] if isinstance(audio, (str, Path)) else audio)]
+    specs = [(_input_key(a), *parse_audio_input(a)) for a in _as_list(audio)]
     labels = []
     for p in paths:
         label = None
         if p is not None:
-            p = Path(p).resolve()
-            for a in inputs:
-                if p == a or a in p.parents:
+            for key, a, _, part in specs:
+                if part is not None:            # dataset partition: chunks are tagged with the input key
+                    if str(p) == key:
+                        label = f"{a.name}{PARTITION_SEPARATOR}{part}"
+                        break
+                    continue
+                rp = Path(p).resolve()
+                if rp == a or a in rp.parents:
                     label = a.stem if a.is_file() else a.name
                     break
         labels.append(label)
@@ -1573,16 +1658,19 @@ def _run_identity(model_path, ckpt_name="last.ckpt"):
 def _audio_inputs_signature(audio, filters=None, exclude=None) -> list:
     from acids_dataset.writers.utils import _VALID_EXTS
     exts = {e.lower() for e in _VALID_EXTS}
-    paths = sorted({str(Path(a).expanduser().resolve()) for a in ([audio] if isinstance(audio, (str, Path)) else audio)})
+    import acids_dataset as ad
     signature = []
-    for p in paths:
-        p = Path(p)
-        if p.is_dir():
+    for key in sorted({_input_key(a) for a in _as_list(audio)}):
+        p, partition_file, part = parse_audio_input(key)
+        if p.is_dir() and ad.is_preprocessed(str(p)):
+            # pre-processed dataset: database and partition files
+            files = sorted(f for f in p.rglob("*") if f.is_file() and not f.name.startswith("."))
+        elif p.is_dir():
             files = sorted(f for f in p.rglob("*") if f.is_file() and f.suffix.lower() in exts
                            and _match_patterns(str(f.relative_to(p)), filters, exclude))
         else:
             files = [p] if _match_patterns(p.name, filters, exclude) else []
-        signature.append([str(p), [[str(f), f.stat().st_size, f.stat().st_mtime] for f in files]])
+        signature.append([key, [[str(f), f.stat().st_size, f.stat().st_mtime] for f in files]])
     return signature
 
 
@@ -1608,7 +1696,19 @@ def _encoder_fingerprint(model) -> list:
     return fp
 
 
-def _load_latents_cache(cache_dir: Path, model):
+def _cache_has_descriptors(extras: dict, meta: dict, needed, pitch_mode) -> bool:
+    if not needed:
+        return True
+    if extras.get("descriptors") is None:
+        return False
+    computed = extras.get("computed_descriptors", list(DESCRIPTORS))       # older caches: all
+    cached_pitch_mode = extras.get("pitch_mode", meta.get("params", {}).get("pitch_mode"))
+    if not set(needed) <= set(computed):
+        return False
+    return "f0" not in needed or cached_pitch_mode == pitch_mode
+
+
+def _load_latents_cache(cache_dir: Path, model, needed_descriptors=(), pitch_mode="pyin"):
     latents_file, extras_file, meta_file = cache_dir / "latents.pt", cache_dir / "extras.pt", cache_dir / "meta.json"
     if not (latents_file.exists() and extras_file.exists() and meta_file.exists()):
         return None
@@ -1617,22 +1717,29 @@ def _load_latents_cache(cache_dir: Path, model):
     if fp.shape != cached_fp.shape or not np.allclose(fp, cached_fp, rtol=1e-3, atol=1e-6):
         _log.info(f"cache {cache_dir} was computed with other encoder weights: recomputing")
         return None
-    extras = torch.load(extras_file, map_location="cpu")
-    if list(extras.get("descriptor_names", [])) != list(DESCRIPTORS):
+    extras = torch.load(extras_file, map_location="cpu", weights_only=False)
+    if list(extras.get("descriptor_names", DESCRIPTORS)) != list(DESCRIPTORS):
         _log.info(f"cache {cache_dir} has other descriptors: recomputing")
         return None
+    if not _cache_has_descriptors(extras, meta, needed_descriptors, pitch_mode):
+        _log.info(f"cache {cache_dir} lacks descriptors {list(needed_descriptors)} "
+                  f"(f0 tracker {pitch_mode}): recomputing")
+        return None
     _log.info(f"loading cached latents from {cache_dir}")
-    return {"latents": torch.load(latents_file, map_location="cpu"), "descriptors": extras["descriptors"],
-            "paths": extras["paths"]}
+    return {"latents": torch.load(latents_file, map_location="cpu"), "descriptors": extras.get("descriptors"),
+            "paths": extras["paths"], "computed_descriptors": extras.get("computed_descriptors", list(DESCRIPTORS)),
+            "pitch_mode": extras.get("pitch_mode", meta.get("params", {}).get("pitch_mode"))}
 
 
 def _save_latents_cache(cache_dir: Path, data: dict, model, audio, params):
     cache_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data["latents"], cache_dir / "latents.pt")
-    torch.save({"descriptors": data["descriptors"], "paths": data["paths"], "descriptor_names": list(DESCRIPTORS)},
+    torch.save({"descriptors": data["descriptors"], "paths": data["paths"], "descriptor_names": list(DESCRIPTORS),
+                "computed_descriptors": data.get("computed_descriptors", []), "pitch_mode": data.get("pitch_mode")},
                cache_dir / "extras.pt")
-    meta = {"audio": sorted(str(Path(a).expanduser().resolve()) for a in ([audio] if isinstance(audio, (str, Path)) else audio)),
+    meta = {"audio": sorted(_input_key(a) for a in _as_list(audio)),
             "params": params, "shape": list(data["latents"].shape),
+            "descriptors": data.get("computed_descriptors", []), "pitch_mode": data.get("pitch_mode"),
             "date": datetime.datetime.now().isoformat(timespec="seconds"),
             "encoder_fingerprint": _encoder_fingerprint(model)}
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -1641,18 +1748,21 @@ def _save_latents_cache(cache_dir: Path, data: dict, model, audio, params):
 
 def get_latents(model, audio, cache_dir=None, force=False, chunk_length: int = 2**17,
                 batch_size: int = 8, max_chunks: Optional[int] = None, device: str = "cpu",
-                filters=None, exclude=None, pitch_mode: str = "pyin") -> dict:
+                filters=None, exclude=None, pitch_mode: str = "pyin", descriptors=None) -> dict:
     """{"latents", "descriptors", "paths"} of audio, loaded from cache_dir if valid (and
-    not force), else computed (and cached in cache_dir if given)."""
+    not force), else computed (and cached in cache_dir if given). descriptors: names of the
+    descriptors needed (none: descriptors are not computed; f0 is only tracked if needed)."""
+    needed = list(descriptors or [])
     if cache_dir is not None and not force:
-        data = _load_latents_cache(Path(cache_dir), model)
+        data = _load_latents_cache(Path(cache_dir), model, needed, pitch_mode)
         if data is not None:
             return data
     data = collect_latents(model, audio, chunk_length, batch_size, max_chunks, device, filters, exclude,
-                           extras=True, pitch_mode=pitch_mode)
+                           extras=True, pitch_mode=pitch_mode if "f0" in needed else None,
+                           descriptors=bool(needed))
     if cache_dir is not None:
         params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels,
-                      filters=list(filters or []), exclude=list(exclude or []), pitch_mode=pitch_mode)
+                      filters=list(filters or []), exclude=list(exclude or []))
         _save_latents_cache(Path(cache_dir), data, model, audio, params)
     return data
 
@@ -1738,25 +1848,29 @@ def add_projections(model_path, name: str, audio, types=("pca",), out=None, over
     for t in types:
         projection_key(name, t)  # validates types early
     cache_dir = None
+    # descriptors (and their f0 tracking) are only computed for projections that use them
+    needed_descriptors = list(descriptors or DESCRIPTORS) if any(
+        SUPERVISED_PROJECTIONS.get(t) == "descriptors" for t in types) else []
 
     def edit(model_or_ckpt):
         nonlocal cache_dir
         model = model_or_ckpt if isinstance(model_or_ckpt, RAVE) else _load_ckpt_model(model_or_ckpt)
         if cache:
-            params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels,
-                          pitch_mode=pitch_mode)
+            params = dict(chunk_length=chunk_length, max_chunks=max_chunks, sr=model.sr, n_channels=model.n_channels)
             cache_dir = latents_cache_dir(model_path, name, audio, root=cache_root, ckpt_name=ckpt_name,
                                           filters=filters, exclude=exclude, **params)
         data = get_latents(model, audio, cache_dir=cache_dir, force=force, chunk_length=chunk_length,
                            filters=filters, exclude=exclude, pitch_mode=pitch_mode,
-                           batch_size=batch_size, max_chunks=max_chunks, device=device)
+                           batch_size=batch_size, max_chunks=max_chunks, device=device,
+                           descriptors=needed_descriptors)
         labels = None
         if "lda" in types:
             labels = chunk_labels(data["paths"], audio, label_regex)
             keep = [i for i, l in enumerate(labels) if l is not None]
             if len(keep) < len(labels):
                 _log.warning(f"{len(labels) - len(keep)} chunks without label are ignored by lda")
-            lda_data = {"latents": data["latents"][keep], "descriptors": data["descriptors"][keep]}
+            lda_data = {"latents": data["latents"][keep],
+                        "descriptors": data["descriptors"][keep] if data.get("descriptors") is not None else None}
             lda_proj = fit_projections(model, lda_data, name, ["lda"], dims, fidelity,
                                        labels=[labels[i] for i in keep])
         else:

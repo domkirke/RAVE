@@ -13,6 +13,10 @@ modes:
   show         prints the name, type and dimensionality of the projections of a model
   purge_cache  removes the latent caches (of --model only, if given)
 
+audio inputs (--audio): folders / files, or parts of partitions of pre-processed acids
+datasets, as /path/to/dataset->part (e.g. ->train, ->val) or /path/to/dataset->file:part
+when several partition files contain the part. Each input is a class for lda.
+
 models (--model):
   * run folder / .ckpt: the checkpoint is edited in place (or written to --out).
   * .ts: the model is uncompiled to a temporary folder, edited, and re-exported with its
@@ -62,7 +66,8 @@ MODES = ("add", "remove", "show", "purge_cache")
 FLAGS = flags.FLAGS
 flags.DEFINE_string("model", None, help="run folder, .ckpt or .ts model")
 flags.DEFINE_string("name", None, help="name of the projections")
-flags.DEFINE_multi_string("audio", None, help="add: audio folder(s) / file(s) to fit projections on")
+flags.DEFINE_multi_string("audio", None, help="add: audio folder(s) / file(s) to fit projections on, or a part of a "
+                          "partition of a pre-processed dataset: /path/to/dataset->train (or ->file:part)")
 flags.DEFINE_multi_string("filter", [], help="add: glob-like pattern(s) selecting audio files, matched against paths "
                           "relative to each --audio folder (or file names), e.g. '*violin*', 'takes/*_close.wav'")
 flags.DEFINE_multi_string("exclude", [], help="add: glob-like pattern(s) of audio files to exclude")

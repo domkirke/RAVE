@@ -924,10 +924,11 @@ class RAVE(pl.LightningModule):
                 self._log_latent_statistics(z_val[:, :z_val.shape[1] // 2])
             if not (self.warmed_up and not self.no_freeze_when_warmed_up) and (self.update_pca):
                 # "vintage" pca computation : perform on one batch, log fidelity
+                # (PCA is computed on posterior means, not on sampled latents)
                 latent_buffer = torch.stack(self.latent_val_buffer, 0)
-                latent_buffer_sampled = self.encoder.reparametrize(latent_buffer)[0].split(self.trainer.val_dataloaders.batch_size, 0)
-                
-                z_batch = latent_buffer_sampled[0]
+                latent_buffer_mean = latent_buffer[:, :latent_buffer.shape[1] // 2].split(self.trainer.val_dataloaders.batch_size, 0)
+
+                z_batch = latent_buffer_mean[0]
                 self._record_vintage_pca(z_batch)
                 self._log_fidelity(self.fidelity, "pca_1")
 
