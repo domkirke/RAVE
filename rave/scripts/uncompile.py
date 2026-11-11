@@ -1,6 +1,6 @@
 """
 Converts an exported TorchScript RAVE model (.ts) back into a trainable `rave.RAVE`
-checkpoint (see `rave.scripting.uncompile` for details on how the config is recovered).
+checkpoint (see `rave.uncompiling.uncompile` for details on how the config is recovered).
 
 Writes into --out (default: <model>_uncompiled next to the .ts):
     last.ckpt       state dict, loadable with rave.load_rave_checkpoint(out)
@@ -18,8 +18,8 @@ from pathlib import Path
 from absl import flags
 
 import rave
-from rave.scripting import (UNCOMPILE_MODES, uncompile, save_uncompiled, compare_state_dicts,
-                            effective_state_dict)
+from rave.uncompiling import (UNCOMPILE_MODES, uncompile, save_uncompiled, compare_state_dicts,
+                              effective_state_dict)
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger("uncompile")

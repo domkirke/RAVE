@@ -37,8 +37,8 @@ import torch
 import cached_conv as cc
 
 import rave
-from rave.scripting import (add_projections, describe_projections, export, format_projections, list_projections,
-                            uncompile)
+from rave.scripting import add_projections, describe_projections, export, format_projections, list_projections
+from rave.uncompiling import uncompile
 
 TESTS_DIR = Path(__file__).parent
 NAME = "test"
