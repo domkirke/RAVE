@@ -736,14 +736,10 @@ def get_training_device(devices: str | List[str], allow_multi: bool = False):
 def get_workers(workers):
     # get data-loader
     if workers is None: workers = -1
-    if os.name == "nt" or sys.platform == "darwin":
-        #TODO re-check
-        num_workers = 0
+    if workers < 0:
+        num_workers = multiprocessing.cpu_count()
     else:
-        if workers < 0:
-            num_workers = multiprocessing.cpu_count()
-        else:
-            num_workers = workers
+        num_workers = workers
     return num_workers
     
 
@@ -795,7 +791,7 @@ def get_weights_from_pattern(pattern: str):
         raise KeyError("no weights found for patterns : %s"%weights)
     return filtered_dict
 
-def get_finetune_keys(model, train=[], freeze=[]):
+def get_finetune_keys(model, mode, train=[], freeze=[]):
     state_dict = model.state_dict()
     weights_to_train = set()
     for t in train:
@@ -806,7 +802,12 @@ def get_finetune_keys(model, train=[], freeze=[]):
         f = parse_weight_shortcut(f)
         keys_to_remove = list(filter(lambda x: re.match(f, x) is not None, weights_to_train))
         weights_to_train.difference_update(keys_to_remove)
-    return list(sorted(weights_to_train))
+    training_keys = list(sorted(weights_to_train))
+    if mode == 'encoder':
+        training_keys = [k for k in training_keys if k.startswith('encoder.')]
+    elif mode == 'decoder': 
+        training_keys = [k for k in training_keys if k.startswith('decoder.')]
+    return training_keys
 
 
 def copy_for_gin_config_copy(obj):

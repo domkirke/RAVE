@@ -3,7 +3,7 @@ import sys
 from absl import app
 
 AVAILABLE_SCRIPTS = [
-    'preprocess', 'train', 'finetune', 'train_prior', 'train_after', 'export', 'export_onnx', 'remote_dataset', 'generate', 'adapt'
+    'preprocess', 'train', 'finetune', 'train_prior', 'train_after', 'export', 'export_onnx', 'remote_dataset', 'generate', 'adapt', 'uncompile'
 ]
 
 
@@ -34,8 +34,8 @@ def main():
         app.run(finetune.main)
     elif command == 'adapt':
         from rave.scripts import adapt
-        sys.argv[0] = train.__name__
-        app.run(adapt.adapt)
+        sys.argv[0] = adapt.__name__
+        app.run(adapt.main)
     elif command == 'train_prior':
         from rave.scripts import train_prior
         sys.argv[0] = train_prior.__name__
@@ -64,5 +64,9 @@ def main():
         from rave.scripts import remote_dataset
         sys.argv[0] = remote_dataset.__name__
         app.run(remote_dataset.main)
+    elif command == 'uncompile':
+        from rave.scripts import uncompile 
+        sys.argv[0] = uncompile.__name__
+        app.run(uncompile.main)
     else:
         raise Exception(f'Command {command} not found')

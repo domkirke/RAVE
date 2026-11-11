@@ -20,12 +20,12 @@ except:
     import rave
 
 import acids_dataset as ad
-ad.fragments.base.FORCE_ARRAY_RESHAPE = False
+ad.fragments.base.FORCE_ARRAY_RESHAPE = False #TODO remove?
 
 import rave
 import rave.core
 import rave.dataset
-from rave.dataset import get_augmentations, parse_transform, NORMALIZE_MODES
+from rave.dataset import NORMALIZE_MODES
 
 
 FLAGS = flags.FLAGS
@@ -74,7 +74,7 @@ flags.DEFINE_multi_string('init_from',
 flags.DEFINE_bool('strict_init', default=True, help = "allows uncomplete transfer if keys are not found (default: None)")                        
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
 flags.DEFINE_integer('workers',
-                     default=0,
+                     default=-1,
                      help='Number of workers to spawn for dataset loading (default: 0, set -1 for automatic mode)')
 flags.DEFINE_multi_string('device', default="auto", help="training device (default: auto. Can be cuda, cuda:0, ..., mps, etc.)")
 flags.DEFINE_bool('derivative',
@@ -83,6 +83,9 @@ flags.DEFINE_bool('derivative',
 flags.DEFINE_string('normalize',
                   default="none",
                   help='Normalizes audio input before loading. Valid options : %s'%NORMALIZE_MODES)
+flags.DEFINE_bool('one_batch_per_file', 
+                  default=False, 
+                  help = "balances training with one random batch per file instead of flattening")
 flags.DEFINE_bool('normalize_dataset', 
                   default=False, 
                   help="Pre-computes loundess of the whole dataset and normalizes input / output data.")
@@ -149,8 +152,6 @@ def main(argv):
 
     # check dataset channels
     n_channels = rave.dataset.get_training_channels(FLAGS.db_path, FLAGS.channels, FLAGS.stereo, FLAGS.midside, FLAGS.ambisonics) 
-    gin.constant('MIDSIDE', FLAGS.midside)
-    gin.constant('AMBISONICS', FLAGS.ambisonics)
     FLAGS.override.append('RAVE.n_channels=%d'%n_channels)
     if FLAGS.beta: FLAGS.override.append("model.BetaWarmupCallback.target_value=%r"%FLAGS.beta)
     
@@ -183,13 +184,15 @@ def main(argv):
                                        gin.query_parameter('%SAMPLING_RATE'),
                                        flags=FLAGS,
                                        augmentations=augmentations,
-                                       n_channels=n_channels)
+                                       n_channels=n_channels, 
+                                       one_batch_per_file=FLAGS.one_batch_per_file
+                                       )
 
     train, val = rave.dataset.split_dataset(dataset, percent=98, training_name=RUN_NAME)
 
 
     # create model
-    model = rave.RAVE(n_channels=n_channels, output_transforms=output_transforms)
+    model = rave.RAVE() # type: ignore
 
     # transfer keys if needed
     if len(FLAGS.init_from) > 0: 
@@ -204,12 +207,28 @@ def main(argv):
     
 
     num_workers = rave.core.get_workers(FLAGS.workers)
-    train = DataLoader(train,
-                       FLAGS.batch,
-                       True,
-                       drop_last=True,
-                       num_workers=num_workers)
-    val = DataLoader(val, FLAGS.batch, False, num_workers=num_workers)
+    # train = DataLoader(train,
+    #                    FLAGS.batch,
+    #                    True,
+    #                    drop_last=True,
+    #                    num_workers=num_workers)
+    # val = DataLoader(val, FLAGS.batch, False, num_workers=num_workers)
+    train = train.get_loader(
+        batch_size=FLAGS.batch,
+        shuffle=True, 
+        drop_last=True, 
+        num_workers = num_workers, 
+        persistent_workers=True
+
+    )
+    val = val.get_loader(
+        batch_size=FLAGS.batch,
+        shuffle=True, 
+        drop_last=True, 
+        num_workers = num_workers, 
+        persistent_workers=True
+
+    )
 
     # CHECKPOINT CALLBACKS
     validation_checkpoint = pl.callbacks.ModelCheckpoint(monitor="validation",

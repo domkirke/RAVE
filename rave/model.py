@@ -207,7 +207,7 @@ class RAVE(pl.LightningModule):
         update_pca=True,
         gradient_clip_gen: Optional[float] = None,
         gradient_clip_dis: Optional[float] = None,
-        output_transforms: Optional[ad.transforms.Transform] = None
+        output_transform: Optional[ad.transforms.Transform] = None
     ):
         super().__init__()
         self.pqmf = pqmf(n_channels=n_channels) if pqmf is not None else None
@@ -274,7 +274,7 @@ class RAVE(pl.LightningModule):
 
         self.register_buffer("receptive_field", torch.tensor([0, 0]).long())
         self.audio_monitor_epochs = audio_monitor_epochs
-        self.output_transforms = output_transforms
+        self.output_transforms = output_transform
 
     @gin.configurable(module="rave")
     def configure_optimizers(self, weight_list = None, lr_gen=1.e-4, lr_dis = 1.e-4):

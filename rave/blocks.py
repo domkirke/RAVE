@@ -29,7 +29,7 @@ import math
 from einops.layers.torch import Rearrange
 
 
-from .cachedConv2D import CachedConv2d, CachedConvTranspose2d
+from cached_conv import CachedConv2d, CachedConvTranspose2d
 
 
 from .core import amp_to_impulse_response, fft_convolve, mod_sigmoid

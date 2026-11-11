@@ -43,12 +43,7 @@ flags.DEFINE_string('out_path',
 flags.DEFINE_multi_string('augment',
                            default = [],
                             help = 'augmentation configurations to use')
-flags.DEFINE_multi_string('train',
-                           default = ["all"],
-                           help = 'specify weights to train')
-flags.DEFINE_multi_string('freeze',
-                           default = [],
-                           help = 'specify weights to freeze')                           
+                         
 flags.DEFINE_integer('max_steps',
                      6000000,
                      help='Maximum number of training steps')
@@ -63,12 +58,21 @@ flags.DEFINE_integer('n_signal',
                      131072,
                      help='Number of audio samples to use during training')
 flags.DEFINE_integer('batch', 8, help='Batch size')
+flags.DEFINE_bool('one_batch_per_file', 
+                  default=False, 
+                  help = "balances training with one random batch per file instead of flattening")
 flags.DEFINE_string('ckpt',
                     None,
                     help='Path to previous checkpoint of the run')
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
 flags.DEFINE_enum('mode', 'encoder', ['encoder', 'full', 'alternating'],
                   help='Fine-tuning objective and update schedule')
+flags.DEFINE_multi_string('train',
+                           default = ["all"],
+                           help = 'specify weights to train (possible values : all, encoder, decoder, discriminator, weight regexp)')
+flags.DEFINE_multi_string('freeze',
+                           default = [],
+                           help = 'specify weights to freeze (possible values : all, encoder, decoder, discriminator, weight regexp)')  
 flags.DEFINE_float('lr_encoder', 1.e-5, help='Encoder learning rate')
 flags.DEFINE_float('lr_decoder', 1.e-4, help='Decoder learning rate')
 flags.DEFINE_float('lr_discriminator', 1.e-4, help='Discriminator learning rate')
@@ -76,9 +80,8 @@ flags.DEFINE_integer('encoder_start_step', 0, help='Fine-tuning batches before e
 flags.DEFINE_float('beta', None, help='Override variational encoder beta (default: source value)')
 flags.DEFINE_float('regularization_weight', None,
                    help='Override latent regularization weight (default: 1)')
-
 flags.DEFINE_integer('workers',
-                     default=0,
+                     default=-1,
                      help='Number of workers to spawn for dataset loading')
 flags.DEFINE_boolean('update_pca', default=True, help="Update latent PCA during validation; use --noupdate_pca to retain the source PCA")
 flags.DEFINE_multi_string('device', default="auto", help="training device (default: auto. Can be cuda, cuda:0, ..., mps, etc.)")
@@ -109,13 +112,6 @@ def add_gin_extension(config_name: str) -> str:
         config_name += '.gin'
     return config_name
 
-def parse_augmentations(augmentations, sr):
-    for a in augmentations:
-        with rave.core.GinEnv(paths=[Path(rave.__file__).parent / "configs" / "augmentations"]):
-            gin.parse_config_file(a)
-            parse_transform()
-            gin.clear_config()
-    return get_augmentations()
 
 class FinetuneCallback(pl.Callback):
 
@@ -161,10 +157,9 @@ def main(argv):
     gin.constant('SAMPLE_RATE', model.sr)
     
     # parse augmentations
+    augmentations = rave.parse_augmentations(map(rave.add_gin_extension, FLAGS.augment), sr=gin.query_parameter('%SAMPLING_RATE'))
     with gin.unlock_config():
-        augmentations = parse_augmentations(map(add_gin_extension, FLAGS.augment), sr=model.sr)
         gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
-
 
     if FLAGS.encoder_start_step < 0:
         raise ValueError('encoder_start_step must be nonnegative')
@@ -182,9 +177,8 @@ def main(argv):
     model.decoder.set_warmed_up(True)
 
     # parse keys to train / freeze 
-    training_keys = rave.core.get_finetune_keys(model, FLAGS.train, FLAGS.freeze)
-    if FLAGS.mode == 'encoder':
-        training_keys = [k for k in training_keys if k.startswith('encoder.')]
+    training_keys = rave.core.get_finetune_keys(model, FLAGS.mode, FLAGS.train, FLAGS.freeze)
+    
     if len(training_keys) == 0:
         raise ValueError('No training keys found with train=%s, freeze=%s'%(FLAGS.train, FLAGS.freeze))
     logging.info("Number of parameters fine-tuned : %d"%len(training_keys))
@@ -192,14 +186,11 @@ def main(argv):
         gin.bind_parameter("rave.configure_optimizers.weight_list", training_keys)
 
     # parse datasset
-    dataset = rave.dataset.get_dataset(FLAGS.db_path,
+    dataset = rave.dataset.get_dataset(FLAGS, 
                                        model.sr,
-                                       FLAGS.n_signal,
-                                       derivative=FLAGS.derivative,
-                                       normalize=FLAGS.normalize,
-                                       rand_pitch=FLAGS.rand_pitch,
                                        augmentations=augmentations,
-                                       n_channels=model.n_channels)
+                                       n_channels=model.n_channels, 
+                                       one_batch_per_file=FLAGS.one_batch_per_file)
 
     train, val = rave.dataset.split_dataset(dataset, percent=98, training_name=RUN_NAME)
     if len(dataset) < model.latent_size:
@@ -208,12 +199,20 @@ def main(argv):
     model.update_pca = FLAGS.update_pca
 
     num_workers = rave.core.get_workers(FLAGS.workers)
-    train = DataLoader(train,
-                       FLAGS.batch,
-                       True,
-                       drop_last=True,
-                       num_workers=num_workers)
-    val = DataLoader(val, FLAGS.batch, False, num_workers=num_workers)
+    train = train.get_loader(
+        batch_size=FLAGS.batch,
+        shuffle=True, 
+        drop_last=True, 
+        num_workers = num_workers, 
+        persistent_workers=True
+    )
+    val = val.get_loader(
+        batch_size=FLAGS.batch,
+        shuffle=True, 
+        drop_last=True, 
+        num_workers = num_workers, 
+        persistent_workers=True
+    )
 
 
     # CHECKPOINT CALLBACKS

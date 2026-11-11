@@ -2,6 +2,7 @@ from typing import Iterable, Tuple, List
 import math
 import numpy as np
 import contextlib
+from pathlib import Path
 import os, yaml
 import gin.torch
 import acids_dataset as ad
@@ -16,7 +17,7 @@ def split_dataset(dataset,
                   features: str | List[str] | None = None, 
                   balance_cardinality: bool = True, 
                   max_residual: int | None = None,
-                  training_name: str | None = None):
+                  training_name: str | None = None) -> Tuple[ad.datasets.AudioDataset, ad.datasets.AudioDataset]:
     if partition is not None:
         assert percent is None, "either percent or partition keyword must be given."
         partdict = dataset.load_partition(partition)
@@ -36,21 +37,36 @@ def split_dataset(dataset,
 
 
 @gin.configurable
-def get_dataset(db_path,
+def get_output_transform(transform):
+    return transform
+
+def parse_output_transform(gin_config):
+    with gin.unlock_config():
+        gin.parse_config_file(str(Path("output_transforms") / Path(gin_config).with_suffix('.gin')))
+    return get_output_transform() #type: ignore
+
+
+@gin.configurable
+def get_dataset(flags,
                 sr,
-                flags, 
                 augmentations: Iterable[ad.transforms.Transform] | None = None, 
-                n_channels: int | None = None): 
+                n_channels: int | None = None, 
+                one_batch_per_file: bool = False): 
                 # derivative: bool = False,
                 # normalize: str | None = None,
                 # rand_pitch: Tuple[float, float] | None = None,
                 # n_channels: int | None = None, **kwargs):
     n_signal = flags.n_signal
+    assert n_channels is not None
     dataset = ad.datasets.AudioDataset(
-        db_path,
+        flags.db_path,
         sr=sr,
-        channels=n_channels
+        channels=n_channels, 
+        chunk_length = flags.n_signal, 
+        batch_by="files" if one_batch_per_file else "dataset"
     )
+
+    
     assert flags.normalize in NORMALIZE_MODES
     normalize_transform = None
     if flags.normalize == "each": 
@@ -87,16 +103,15 @@ def get_dataset(db_path,
         transform_list.extend(augmentations)
 
     if flags.midside: 
-        output_transform = ad.transforms.MidSide()
+        output_transform = parse_output_transform('midside')
         transform_list.append(output_transform)
     elif flags.ambisonics:
-        output_transform = ad.transforms.AmbisonicEncoder()
+        with gin.unlock_config(): 
+            gin.constant('AMBISONICS_ORDER', int(math.sqrt(n_channels - 1)))
+        output_transform = parse_output_transform('ambisonics')
         transform_list.append(output_transform)
-
     dataset.transforms = transform_list
     return dataset, output_transform
-
-
 
 def get_channels_from_dataset(db_path):
     if ad.is_preprocessed(db_path): 
