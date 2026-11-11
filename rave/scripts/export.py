@@ -53,6 +53,9 @@ flags.DEFINE_string('name',
 flags.DEFINE_string('out_path', 
                      default= None,
                      help = "output location of scripted model")
+flags.DEFINE_string('ckpt_name',
+                    default='last.ckpt',
+                    help='checkpoint file to export from the run (default: last.ckpt, else the most recently written one)')
 flags.DEFINE_bool('ema_weights',
                   default=False,
                   help='Use ema weights if avaiable')
@@ -95,6 +98,7 @@ def main(argv):
            sr=FLAGS.sr,
            prior=FLAGS.prior,
            use_causal_stft=FLAGS.use_causal_stft,
+           ckpt_name=FLAGS.ckpt_name,
            db_path=FLAGS.db_path,
            db_partition=FLAGS.db_partition,
            ica=FLAGS.ica,

@@ -377,7 +377,24 @@ class RAVE(pl.LightningModule):
             optimizers.append({'optimizer': dis_opt})
             return tuple(optimizers)
 
+    def _remap_legacy_conv2d_keys(self, state_dict):
+        """checkpoints trained with rave.cachedConv2D.CachedConv2d store 2D convolution weights
+        under a `.causal_conv.` submodule; cached_conv.CachedConv2d holds them directly. Such keys
+        are renamed when the renamed key exists in the model (and the original one does not)."""
+        own = self.state_dict()
+        renamed = {}
+        for k in state_dict:
+            if ".causal_conv." in k and k not in own:
+                new_k = k.replace(".causal_conv.", ".")
+                if new_k in own and new_k not in state_dict:
+                    renamed[k] = new_k
+        if not renamed:
+            return state_dict
+        logging.info(f"loading {len(renamed)} legacy 2D convolution weights (.causal_conv.)")
+        return type(state_dict)((renamed.get(k, k), v) for k, v in state_dict.items())
+
     def load_state_dict(self, state_dict, strict = True, assign = False):
+        state_dict = self._remap_legacy_conv2d_keys(state_dict)
         projections_keys = filter(lambda x: x.startswith('projections.'), state_dict.keys())
         for p in projections_keys:
             proj_name = p.replace('projections.', '')

@@ -128,7 +128,8 @@ def search_for_run(run_path, name="last.ckpt"):
     ckpts = get_ckpts(str(run_path))
     if len(ckpts) != 0:
         if name is None: 
-            ordered = sorted(ckpts, key=os.path.getctime, reverse=True)
+            # most recently written checkpoint (ctime changes with metadata, e.g. on file sync)
+            ordered = sorted(ckpts, key=os.path.getmtime, reverse=True)
             return ordered[0]
         else:
             ckpts = list(filter(lambda x: os.path.basename(x) == name, ckpts))

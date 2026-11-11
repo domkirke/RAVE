@@ -155,6 +155,9 @@ class DumbPrior(nn.Module):
 class DumbSpectrogram(nn.Module): 
     def forward(self, x: torch.Tensor):
         return x
+    @torch.jit.export
+    def inverse(self, x: torch.Tensor):
+        return x
 
 class DumbOutputTransform(nn.Module):
     def forward(self, x: torch.Tensor):
@@ -177,7 +180,8 @@ class ScriptedRAVE(nn_tilde.Module):
                  extra_projections: Optional[dict] = None) -> None:
 
         super().__init__()
-        self.pqmf = pretrained.pqmf
+        # identity placeholder for models without pqmf (all branches are compiled by TorchScript)
+        self.pqmf = pretrained.pqmf if pretrained.pqmf is not None else DumbPQMF()
         self.sr = pretrained.sr
         self.spectrogram = pretrained.spectrogram or DumbSpectrogram()
         self.resampler = None
@@ -427,6 +431,8 @@ class ScriptedRAVE(nn_tilde.Module):
             x = x.reshape(-1, 1, x.shape[-1])
             x = self.pqmf(x)
             x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode == "complex_stft":
+            x = self.spectrogram(x)
         elif self.input_mode == "mel":
             if self.spectrogram is not None:
                 x = self.spectrogram(x)[..., :-1]
@@ -460,6 +466,8 @@ class ScriptedRAVE(nn_tilde.Module):
             y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
             y = self.pqmf.inverse(y)
             y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode == "complex_stft":
+            y = self.spectrogram.inverse(y)
 
         y = self.output_transform.invert(y)
 
@@ -638,6 +646,8 @@ class VariationalScriptedRAVE(ScriptedRAVE):
             y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
             y = self.pqmf.inverse(y)
             y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode == "complex_stft":
+            y = self.spectrogram.inverse(y)
 
         if self.resampler is not None:
             y = self.resampler.from_model_sampling_rate(y)
@@ -922,15 +932,20 @@ def _load_prior(prior_path, pretrained, latent_size, fidelity):
             return None
 
 
-def _clear_streaming_caches(module):
-    """warmup and nn~ checks populate caches: do not serialize that state."""
-    from cached_conv import CachedConvTranspose2d, CachedPadding
+def _clear_streaming_caches(module, stft: bool = True):
+    """warmup and nn~ checks populate caches: do not serialize that state. Cache buffers
+    ("pad" / "cache") of cached convolutions are reset to zeros, i.e. the state of a fresh
+    model (cached_conv allocates them once, for max_batch_size items: they must keep their
+    shape), and, if stft, buffers of streaming STFTs are emptied."""
     for m in module.modules():
-        if isinstance(m, (CachedPadding2d, CachedPadding)):
-            m.pad = m.pad[:0].clone()
-        elif isinstance(m, CachedConvTranspose2d):
-            m.cache = m.cache[:0].clone()
-        elif isinstance(m, CausalSTFT):
+        if type(m).__module__.startswith(("cached_conv", "rave.cachedConv2D")):
+            for name in ("pad", "cache"):
+                buf = m._buffers.get(name)
+                if isinstance(buf, torch.Tensor):
+                    buf.zero_()
+        if not stft:
+            continue
+        if isinstance(m, CausalSTFT):
             m.audio_buffer = m.audio_buffer[:0].clone()
             m.ola_buffer = m.ola_buffer[:0].clone()
             m.envelope_buffer = m.envelope_buffer[:0].clone()
@@ -1137,8 +1152,9 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
         else:
             ts_path = out_path / (model_name + ".ts")
         ts_path.parent.mkdir(parents=True, exist_ok=True)
-        if streaming:
-            _clear_streaming_caches(scripted_rave)
+        # always clear convolution caches (some 2D convolutions cache even in non-streaming
+        # mode); streaming STFT buffers only for streaming exports
+        _clear_streaming_caches(scripted_rave, stft=streaming)
         scripted_rave.export_to_ts(str(ts_path))
 
         try:
