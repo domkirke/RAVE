@@ -19,6 +19,8 @@ import rave
 import rave.dataset
 import rave.prior
 
+from rave.dataset import NORMALIZE_MODES
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('name', None, help='Name of the run')
@@ -47,9 +49,9 @@ flags.DEFINE_integer('seed',
 flags.DEFINE_bool('derivative',
                   default=False,
                   help='Train RAVE on the derivative of the signal')
-flags.DEFINE_bool('normalize',
-                  default=False,
-                  help='Train RAVE on normalized signals')
+flags.DEFINE_string('normalize',
+                  default="none",
+                  help='Normalizes audio input before loading. Valid options : %s'%NORMALIZE_MODES)
 flags.DEFINE_list('rand_pitch',
                   default=None,
                   help='activates random pitch')
@@ -91,28 +93,27 @@ def main(argv):
     if isinstance(pretrained.encoder, rave.blocks.VariationalEncoder):
         prior = rave.prior.VariationalPrior(pretrained_vae=pretrained, fidelity=FLAGS.fidelity, latent_size=FLAGS.latent_size, n_channels=n_channels)
     elif isinstance(pretrained.encoder, rave.blocks.WasserteinEncoder):
-        prior = rave.prior.WasserteinEncoder(pretrained_vae=pretrained, fidelity=FLAGS.fidelity, latent_size=FLAGS.latent_size, n_channels=n_channels)
+        prior = rave.prior.WassersteinPrior(pretrained_vae=pretrained, fidelity=FLAGS.fidelity, latent_size=FLAGS.latent_size, n_channels=n_channels)
     else:
         raise NotImplementedError("prior not implemented for encoder of type %s"%(type(pretrained.encoder)))
 
-    dataset = rave.dataset.get_dataset(FLAGS.db_path,
+    FLAGS.n_signal = max(FLAGS.n_signal, prior.min_receptive_field)
+    dataset = rave.dataset.get_dataset(FLAGS,
                                        pretrained.sr,
-                                       max(FLAGS.n_signal, prior.min_receptive_field),
-                                       derivative=FLAGS.derivative,
-                                       normalize=FLAGS.normalize,
-                                       rand_pitch=FLAGS.rand_pitch,
-                                       n_channels=pretrained.n_channels)
+                                       n_channels=pretrained.n_channels, 
+                                       one_batch_per_file=False
+                                       )
 
     train, val = rave.dataset.split_dataset(dataset, percent=98, training_name=rave.get_run_name(run_path))
 
     # get data-loader
     num_workers = rave.core.get_workers(FLAGS.workers)
-    train = DataLoader(train,
-                       FLAGS.batch,
-                       True,
-                       drop_last=True,
-                       num_workers=num_workers)
-    val = DataLoader(val, FLAGS.batch, False, num_workers=num_workers)
+    train = train.get_loader(
+        FLAGS.batch, True, drop_last=True, num_workers=num_workers, persistent_workers=True
+    )
+    val = val.get_loader(
+        FLAGS.batch, False, num_workers=num_workers, persistent_workers=True
+    )
 
     # CHECKPOINT CALLBACKS
     validation_checkpoint = pl.callbacks.ModelCheckpoint(monitor="validation",

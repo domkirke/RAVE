@@ -881,9 +881,12 @@ class GinEnv(object):
             gin.config._CONSTANTS = self._dict['_CONSTANTS']
         for p in self._paths: 
             gin.add_config_file_search_path(p)
+        # unlock for the scope of the environment (gin.unlock_config is a context manager,
+        # calling it has no effect); the previous lock state is restored on exit
+        gin.config._set_config_is_locked(False)
         if len(self._configs) or len(self._bindings):
             gin.parse_config_files_and_bindings(self._configs, self._bindings)
-        gin.unlock_config()
+            gin.config._set_config_is_locked(False)
 
     def __exit__(self, *args):
         gin.clear_config()

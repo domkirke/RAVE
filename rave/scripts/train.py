@@ -180,9 +180,9 @@ def main(argv):
     RUN_NAME = f'{FLAGS.name}_{gin_hash}'
 
     # parse datasset
-    dataset, output_transforms = rave.dataset.get_dataset(FLAGS.db_path,
+    dataset = rave.dataset.get_dataset(
+                                       FLAGS, 
                                        gin.query_parameter('%SAMPLING_RATE'),
-                                       flags=FLAGS,
                                        augmentations=augmentations,
                                        n_channels=n_channels, 
                                        one_batch_per_file=FLAGS.one_batch_per_file

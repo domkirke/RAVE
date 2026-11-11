@@ -13,3 +13,5 @@ runs
 __version__*
 PKG-INFO
 .junit-test-report.xml
+rave/.dimred_cache/
+tests/outs/

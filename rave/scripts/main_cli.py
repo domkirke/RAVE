@@ -3,7 +3,7 @@ import sys
 from absl import app
 
 AVAILABLE_SCRIPTS = [
-    'preprocess', 'train', 'finetune', 'train_prior', 'train_after', 'export', 'export_onnx', 'remote_dataset', 'generate', 'adapt', 'uncompile'
+    'preprocess', 'train', 'finetune', 'train_prior', 'train_after', 'export', 'export_onnx', 'remote_dataset', 'generate', 'adapt', 'uncompile', 'dimred'
 ]
 
 
@@ -68,5 +68,9 @@ def main():
         from rave.scripts import uncompile 
         sys.argv[0] = uncompile.__name__
         app.run(uncompile.main)
+    elif command == 'dimred':
+        from rave.scripts import dimred
+        sys.argv[0] = dimred.__name__
+        app.run(dimred.main)
     else:
         raise Exception(f'Command {command} not found')

@@ -12,13 +12,14 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from einops import rearrange
-from sklearn.decomposition import PCA, IncrementalPCA, FastICA
+from sklearn.decomposition import PCA
 from pytorch_lightning.trainer.states import RunningStage
 
 
 import rave.core
 
 from . import blocks
+from .projections import ica_relevance
 
 MAX_LATENT_FOR_VALIDATION = 20000
 MAX_AUDIO_FOR_LOGGING = 32
@@ -274,7 +275,7 @@ class RAVE(pl.LightningModule):
 
         self.register_buffer("receptive_field", torch.tensor([0, 0]).long())
         self.audio_monitor_epochs = audio_monitor_epochs
-        self.output_transforms = output_transform
+        self.output_transform = output_transform
 
     @gin.configurable(module="rave")
     def configure_optimizers(self, weight_list = None, lr_gen=1.e-4, lr_dis = 1.e-4):
@@ -853,34 +854,6 @@ class RAVE(pl.LightningModule):
         var = torch.from_numpy(np.cumsum(var))
         return components, z_mean, var
 
-    def _compute_ipca(self, z):
-        z = rearrange(z, "b c t -> (b t) c")
-        z_mean = z.mean(0)
-        z = z - z_mean
-        
-        pca = IncrementalPCA(z.shape[-1]).fit(z)
-        components = pca.components_
-        components = torch.from_numpy(components)
-
-        var = pca.explained_variance_ / np.sum(pca.explained_variance_)
-        var = torch.from_numpy(np.cumsum(var))
-        return components, z_mean, var
-
-    def _compute_ica(self, z):
-        z = rearrange(z, "b c t -> (b t) c")
-        
-        pca = FastICA(z.shape[-1], whiten="unit-variance").fit(z)
-        components = pca.components_
-        mixing = pca.mixing_
-        mean = torch.from_numpy(pca.mean_).unsqueeze(0).repeat_interleave(pca.mean_.shape[0], dim=0)
-
-        components = torch.from_numpy(components)
-        mixing = torch.from_numpy(mixing)
-        whitening = torch.from_numpy(pca.whitening_)
-
-        return torch.stack([mean[None], components, mixing, whitening])
-
-
     def _record_vintage_pca(self, z):
         pca, mean, var = self._compute_pca(z)
         self.latent_mean.copy_(mean.to(self.latent_mean))
@@ -897,12 +870,23 @@ class RAVE(pl.LightningModule):
         # record full pca from means
         pca, mean, var = self._compute_pca(latent_full[:, :latent_full.shape[1] // 2])
         self.projections['pca_full_mean'] = torch.cat([mean[None], var[None], pca], 0).cpu()
-        # record IPCA from mean
-        pca, mean, var = self._compute_ipca(latent_full[:, :latent_full.shape[1] // 2])
-        self.projections['ipca'] = torch.cat([mean[None], var[None], pca], 0).cpu()
-        # record ICA from mean
-        ica = self._compute_ica(latent_full[:, :latent_full.shape[1] // 2])
-        self.projections['ica'] = ica
+
+    def _log_latent_statistics(self, z_mean, active_threshold: float = .01, fidelity: float = .99):
+        """logs latent health metrics from validation posterior means z_mean (b, c, t):
+          * latent_active_dims: dimensions whose posterior mean varies across validation
+            frames (variance > active_threshold; collapsed dimensions follow the prior).
+          * latent_nongaussian_dims / latent_gaussian_test_dims: number of non-gaussian
+            dimensions in the PCA-whitened subspace reaching `fidelity` (skewness / kurtosis
+            test of projections.ica_relevance), i.e. whether independent sources (ICA) exist."""
+        z = rearrange(z_mean, "b c t -> (b t) c").double()
+        n_active = int((z.var(0) > active_threshold).sum())
+        self.log("latent_active_dims", float(n_active))
+        _, info = ica_relevance(z_mean, fidelity=fidelity)
+        self.log("latent_gaussian_test_dims", float(info["n_components"]))
+        if "n_nongaussian" in info:
+            self.log("latent_nongaussian_dims", float(info["n_nongaussian"]))
+        else:
+            logging.info(f"latent gaussianity not measured: {info['reason']}")
 
     def _log_fidelity(self, var, name, percent = [.8, .9, .95, .99]):
         for p in percent:
@@ -918,6 +902,9 @@ class RAVE(pl.LightningModule):
 
         audio = torch.cat(self.audio_val_buffer, 0)
         if isinstance(self.encoder, blocks.VariationalEncoder):
+            if len(self.latent_val_buffer) > 0:
+                z_val = torch.stack(self.latent_val_buffer, 0)
+                self._log_latent_statistics(z_val[:, :z_val.shape[1] // 2])
             if not (self.warmed_up and not self.no_freeze_when_warmed_up) and (self.update_pca):
                 # "vintage" pca computation : perform on one batch, log fidelity
                 latent_buffer = torch.stack(self.latent_val_buffer, 0)

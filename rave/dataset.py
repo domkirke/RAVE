@@ -65,7 +65,6 @@ def get_dataset(flags,
         chunk_length = flags.n_signal, 
         batch_by="files" if one_batch_per_file else "dataset"
     )
-
     
     assert flags.normalize in NORMALIZE_MODES
     normalize_transform = None
@@ -102,16 +101,16 @@ def get_dataset(flags,
     if augmentations:
         transform_list.extend(augmentations)
 
-    if flags.midside: 
+    if getattr(flags, "midside", False): 
         output_transform = parse_output_transform('midside')
         transform_list.append(output_transform)
-    elif flags.ambisonics:
+    elif getattr(flags, "ambisonics", False):
         with gin.unlock_config(): 
             gin.constant('AMBISONICS_ORDER', int(math.sqrt(n_channels - 1)))
         output_transform = parse_output_transform('ambisonics')
         transform_list.append(output_transform)
     dataset.transforms = transform_list
-    return dataset, output_transform
+    return dataset
 
 def get_channels_from_dataset(db_path):
     if ad.is_preprocessed(db_path): 

@@ -26,7 +26,7 @@ ad.fragments.base.FORCE_ARRAY_RESHAPE = False
 import rave
 import rave.core
 import rave.dataset
-from rave.dataset import get_augmentations, parse_transform
+from rave.dataset import NORMALIZE_MODES
 
 
 FLAGS = flags.FLAGS
@@ -88,9 +88,9 @@ flags.DEFINE_multi_string('device', default="auto", help="training device (defau
 flags.DEFINE_bool('derivative',
                   default=False,
                   help='Train RAVE on the derivative of the signal')
-flags.DEFINE_bool('normalize',
-                  default=False,
-                  help='Train RAVE on normalized signals')
+flags.DEFINE_string('normalize',
+                  default="none",
+                  help='Normalizes audio input before loading. Valid options : %s'%NORMALIZE_MODES)
 flags.DEFINE_list('rand_pitch',
                   default=None,
                   help='activates random pitch')
