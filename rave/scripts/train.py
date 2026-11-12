@@ -65,7 +65,7 @@ flags.DEFINE_bool('midside', False, help="flag to force stereo mid-side training
 flags.DEFINE_bool('ambisonics', False, help="activates ambisonic mode : encodes the input signal before training")
 flags.DEFINE_integer('channels', 0, help="overrides the exact number of training channels (0 takes the one from dataset)")
 flags.DEFINE_integer('batch', 8, help='Batch size')
-flags.DEFINE_string('ckpt',
+flags.DEFINE_string('resume',
                     None,
                     help='Path to previous checkpoint of the run')
 flags.DEFINE_multi_string('init_from', 
@@ -156,8 +156,8 @@ def main(argv):
     if FLAGS.beta: FLAGS.override.append("model.BetaWarmupCallback.target_value=%r"%FLAGS.beta)
     
     # parse configuration
-    if FLAGS.ckpt:
-        config_file = rave.core.search_for_config(FLAGS.ckpt)
+    if FLAGS.resume:
+        config_file = rave.core.search_for_config(FLAGS.resume)
         if config_file is None:
             logging.error('Config file not found in %s'%FLAGS.run)
             exit()
@@ -264,12 +264,12 @@ def main(argv):
         callbacks.append(EMA(FLAGS.ema))
 
     run = None
-    if FLAGS.ckpt:
-        run = rave.core.search_for_run(FLAGS.ckpt)
+    if FLAGS.resume:
+        run = rave.core.search_for_run(FLAGS.resume)
         if run is None: 
-            run = rave.core.search_for_run(FLAGS.ckpt, None)
+            run = rave.core.search_for_run(FLAGS.resume, None)
             if run is None:
-                logging.error('could not find model with ckpt=%s. Maybe provide a more detailed path'%FLAGS.ckpt)
+                logging.error('could not find model with ckpt=%s. Maybe provide a more detailed path'%FLAGS.resume)
                 exit()
 
     trainer = pl.Trainer(

@@ -78,8 +78,8 @@ def main(argv):
     
     # parse configuration
     gin.constant('SAMPLE_RATE', pretrained.sr)
-    if FLAGS.ckpt:
-        config_file = rave.core.search_for_config(FLAGS.ckpt)
+    if FLAGS.resume:
+        config_file = rave.core.search_for_config(FLAGS.resume)
         if config_file is None:
             print('Config gile not found in %s'%FLAGS.run)
         gin.parse_config_file(config_file)
@@ -162,7 +162,7 @@ def main(argv):
         **val_check,
     )
 
-    run = rave.core.search_for_run(FLAGS.ckpt)
+    run = rave.core.search_for_run(FLAGS.resume)
     if run is not None:
         print('loading state from file %s'%run)
         loaded = torch.load(run, map_location='cpu')

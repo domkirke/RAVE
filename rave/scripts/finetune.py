@@ -61,7 +61,7 @@ flags.DEFINE_integer('batch', 8, help='Batch size')
 flags.DEFINE_bool('one_batch_per_file', 
                   default=False, 
                   help = "balances training with one random batch per file instead of flattening")
-flags.DEFINE_string('ckpt',
+flags.DEFINE_string('resume',
                     None,
                     help='Path to previous checkpoint of the run')
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
@@ -244,12 +244,12 @@ def main(argv):
     ]
 
     run = None
-    if FLAGS.ckpt:
-        run = rave.core.search_for_run(FLAGS.ckpt)
+    if FLAGS.resume:
+        run = rave.core.search_for_run(FLAGS.resume)
         if run is None: 
-            run = rave.core.search_for_run(FLAGS.ckpt, None)
+            run = rave.core.search_for_run(FLAGS.resume, None)
             if run is None:
-                logging.error('could not find model with ckpt=%s. Maybe provide a more detailed path: %s'%FLAGS.ckpt)
+                logging.error('could not find model with ckpt=%s. Maybe provide a more detailed path: %s'%FLAGS.resume)
                 exit()
 
     trainer = pl.Trainer(
