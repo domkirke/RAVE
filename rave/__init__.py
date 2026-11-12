@@ -111,7 +111,7 @@ def add_gin_extension(config_name: str) -> str:
 def parse_augmentations(augmentations, sr):
     for a in augmentations:
         sr = gin.query_parameter('%SAMPLING_RATE')
-        with core.GinEnv(paths=[Path(ad.__file__).parent / "configs" / "augmentations"], bindings="SAMPLE_RATE=%d"%sr, configs=[a]):
+        with ad.GinEnv(paths=[Path(ad.__file__).parent / "configs" / "augmentations"], bindings="SAMPLE_RATE=%d"%sr, configs=[a]):
             ad.utils.parse_transform()
     return get_augmentations()
 

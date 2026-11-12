@@ -13,7 +13,7 @@ NORMALIZE_MODES = ['none', 'dataset', 'dataset_compress', 'each', 'each_compress
 @gin.configurable(module="data")
 def split_dataset(dataset, 
                   partition: str | None = None, 
-                  percent: float | None = None, 
+                  percent: float = 95, 
                   features: str | List[str] | None = None, 
                   balance_cardinality: bool = True, 
                   max_residual: int | None = None,
@@ -24,12 +24,7 @@ def split_dataset(dataset,
     elif (training_name is not None) and (dataset.has_partition(training_name)): 
         partdict = dataset.load_partition(training_name)
     else: 
-        split1 = max((percent * len(dataset)) // 100, 1)
-        split2 = len(dataset) - split1
-        if max_residual is not None:
-            split2 = min(max_residual, split2)
-            split1 = len(dataset) - split2
-        partdict = dataset.split(partitions={'train': split1 / len(dataset), 'test': split2 / len(dataset)}, 
+        partdict = dataset.split(partitions={'train': percent / 100, 'test': 1 - percent / 100},
                                  features=features, 
                                  balance_cardinality=balance_cardinality,
                                  write=training_name)
