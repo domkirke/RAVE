@@ -493,10 +493,10 @@ class RAVE(pl.LightningModule):
         return loss_weight
 
     def _invert(self, x):
-        if self.output_transforms is None: 
+        if self.output_transform is None: 
             return x
         else:
-            return self.output_transforms.invert(x)
+            return self.output_transform.invert(x)
 
     def encode_compressed(self, x, fidelity = 0.99):
         z = self.encode(x, return_mb=False)
