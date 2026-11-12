@@ -192,7 +192,7 @@ def main(argv):
                                        n_channels=model.n_channels, 
                                        one_batch_per_file=FLAGS.one_batch_per_file)
 
-    train, val = rave.dataset.split_dataset(dataset, percent=98, training_name=RUN_NAME)
+    train, val = rave.dataset.split_dataset(dataset, percent=90, training_name=RUN_NAME)
     if len(dataset) < model.latent_size:
         train, val = dataset, dataset
 

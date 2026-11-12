@@ -15,7 +15,7 @@ def split_dataset(dataset,
                   partition: str | None = None, 
                   percent: float = 95, 
                   features: str | List[str] | None = None, 
-                  balance_cardinality: bool = True, 
+                  balance_cardinality: bool = False, 
                   max_residual: int | None = None,
                   training_name: str | None = None) -> Tuple[ad.datasets.AudioDataset, ad.datasets.AudioDataset]:
     if partition is not None:

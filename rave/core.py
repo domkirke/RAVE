@@ -741,7 +741,7 @@ def get_workers(workers):
         num_workers = multiprocessing.cpu_count()
     else:
         num_workers = workers
-    return num_workers
+    return min(num_workers, 32)
     
 
 # transfer / fine-tune related callbacks
