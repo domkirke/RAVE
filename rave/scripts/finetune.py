@@ -65,7 +65,7 @@ flags.DEFINE_string('resume',
                     None,
                     help='Path to previous checkpoint of the run')
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
-flags.DEFINE_enum('mode', 'encoder', ['encoder', 'full', 'alternating'],
+flags.DEFINE_enum('mode', 'encoder', ['encoder', 'decoder', 'full', 'alternating'],
                   help='Fine-tuning objective and update schedule')
 flags.DEFINE_multi_string('train',
                            default = ["all"],
