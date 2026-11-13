@@ -166,9 +166,22 @@ class DumbOutputTransform(nn.Module):
     def invert(self, x: torch.Tensor):
         return x
 
+def latent_size_from_fidelity(cum_var, fidelity: float | None, full_latent_size: int) -> int:
+    """number of PCA dimensions reaching `fidelity` (cumulated explained variance cum_var), rounded
+    to the next power of 2 and bounded by full_latent_size. Without fidelity, or if no PCA was
+    computed (cum_var is zero), returns full_latent_size."""
+    cum_var = np.asarray(torch.as_tensor(cum_var).detach().cpu())
+    if fidelity is None or not np.any(cum_var > 0):
+        return full_latent_size
+    latent_size = max(int(np.argmax(cum_var > fidelity)), 1)
+    return min(2**math.ceil(math.log2(latent_size)), full_latent_size)
+
+
 class ScriptedRAVE(nn_tilde.Module):
 
     _attributes_for_tb_scripting = ['projections_names', 'projection_idx']
+    # continuous latent spaces (variational / wasserstein) go through projections
+    _continuous_latent = False
 
     def __init__(self,
                  pretrained: RAVE,
@@ -177,9 +190,11 @@ class ScriptedRAVE(nn_tilde.Module):
                  target_sr: bool = None, 
                  prior: Prior = None,
                  latent_size: int = None,
-                 extra_projections: Optional[dict] = None) -> None:
+                 extra_projections: Optional[dict] = None,
+                 use_pca: bool = True) -> None:
 
         super().__init__()
+        self.use_pca = use_pca
         # identity placeholder for models without pqmf (all branches are compiled by TorchScript)
         self.pqmf = pretrained.pqmf if pretrained.pqmf is not None else DumbPQMF()
         self.sr = pretrained.sr
@@ -228,8 +243,17 @@ class ScriptedRAVE(nn_tilde.Module):
 
         # projection handling
         self._has_projections = hasattr(pretrained, "projections")
+        latent_mean, latent_pca = pretrained.latent_mean, pretrained.latent_pca
+        if not self.use_pca:
+            # no_pca: the default projection is the raw latent space
+            latent_mean, latent_pca = torch.zeros_like(latent_mean), torch.eye(latent_pca.shape[0]).to(latent_pca)
         self.projections_names = ['default']
-        projections = nn.ModuleList([PCAProjection.from_params(pretrained.latent_mean, pretrained.fidelity, pretrained.latent_pca, name="default")])
+        projections = nn.ModuleList([PCAProjection.from_params(latent_mean, pretrained.fidelity, latent_pca, name="default")])
+        if self._continuous_latent and self.use_pca:
+            # "raw": bypasses the PCA (raw latent space)
+            self.projections_names.append('raw')
+            projections.append(PCAProjection.from_params(torch.zeros_like(latent_mean), pretrained.fidelity,
+                                                         torch.eye(latent_pca.shape[0]).to(latent_pca), name="raw"))
         if self._has_projections:
             for k, v in pretrained.projections.items():
                 if k.startswith('pca'):
@@ -252,24 +276,22 @@ class ScriptedRAVE(nn_tilde.Module):
         receptive_field = getattr(pretrained, "receptive_field", None)
         self.register_attribute("receptive_field", (int(receptive_field[0]), int(receptive_field[1])))
         self.projection_idx = nn.Parameter(torch.tensor(0.), requires_grad=False)
-        self.register_buffer("latent_pca", pretrained.latent_pca)
-        self.register_buffer("latent_mean", pretrained.latent_mean)
+        self.register_buffer("latent_pca", latent_pca)
+        self.register_buffer("latent_mean", latent_mean)
         self.register_buffer("fidelity", pretrained.fidelity)
 
-        if latent_size is None:
-            if isinstance(pretrained.encoder, blocks.VariationalEncoder):
-                if fidelity is None:
-                    latent_size = self.full_latent_size
-                else:
-                    latent_size = max(
-                        np.argmax(pretrained.fidelity.detach().cpu().numpy() > fidelity), 1)
-                    latent_size = 2**math.ceil(math.log2(latent_size))
-
-            elif isinstance(pretrained.encoder, blocks.DiscreteEncoder):
+        if self._continuous_latent:
+            # variational / wasserstein: no_pca -> full latent space ; explicit latent_size ;
+            # else from fidelity (full latent space if no PCA was computed)
+            if not self.use_pca:
+                latent_size = self.full_latent_size
+            elif latent_size is None:
+                latent_size = latent_size_from_fidelity(pretrained.fidelity, fidelity, self.full_latent_size)
+            assert 0 < latent_size <= self.full_latent_size, \
+                "latent_size must be in [1, %d]" % self.full_latent_size
+        elif latent_size is None:
+            if isinstance(pretrained.encoder, blocks.DiscreteEncoder):
                 latent_size = pretrained.encoder.num_quantizers
-
-            elif isinstance(pretrained.encoder, blocks.WasserteinEncoder):
-                latent_size = pretrained.latent_size
 
             elif isinstance(pretrained.encoder, blocks.SphericalEncoder):
                 latent_size = pretrained.latent_size - 1
@@ -551,13 +573,15 @@ class ScriptedRAVE(nn_tilde.Module):
             return torch.tensor(0)
         
 
-class VariationalScriptedRAVE(ScriptedRAVE):
+class ContinuousScriptedRAVE(ScriptedRAVE):
+    """continuous latent spaces (variational / wasserstein). Latents are encoded through the
+    selected projection ("default": PCA of the model, or the raw latent space with use_pca=False;
+    "raw": raw latent space; custom projections), cropped to latent_size, and decoded through its
+    inverse (missing dimensions completed with noise * temperature)."""
+    _continuous_latent = True
 
-    def __init__(self, *args, use_pca=True, **kwargs):
-        self.use_pca = use_pca
-        super(VariationalScriptedRAVE, self).__init__(*args, **kwargs)
-        if self.use_pca:
-            assert self.latent_size <= self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.register_method(
             "encode_full",
             in_channels=self.n_channels,
@@ -582,22 +606,6 @@ class VariationalScriptedRAVE(ScriptedRAVE):
             ],
             output_labels=['(signal) Channel %d'%d for d in range(1, self.target_channels+1)]
         )
-        self.register_method(
-            "encode_dist",
-            in_channels=self.n_channels,
-            in_ratio=self.encode_params[1],
-            out_channels=self.latent_size * 2,
-            out_ratio=self.encode_params[3],
-            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels+1)],
-            output_labels=[
-                f'(signal) Latent mean {i + 1}'
-                for i in range(self.latent_size)
-            ] + [
-                f'(signal) Latent std {i + 1}'
-                for i in range(self.latent_size)
-            ],
-        )
-    
     @torch.jit.export
     def encode_full(self, x):
         if self.stereo_mode:
@@ -664,6 +672,60 @@ class VariationalScriptedRAVE(ScriptedRAVE):
             y = y[:, :self.target_channels]
         return y
 
+    def _reparametrize(self, z):
+        # encoder output -> latent sample
+        return z
+
+    def _augment(self, z):
+        # latent -> decoder input
+        return z
+
+    def post_process_latent(self, z):
+        z = self._reparametrize(z)
+        z = self.projections(z, int(self.projection_idx.item()), self.latent_size)
+        return z[:, :self.latent_size]
+
+    def post_process_latent_full(self, z):
+        # full latent space, without projection
+        return self._reparametrize(z)
+
+    def pre_process_latent(self, z):
+        z = self.projections.inverse(z, int(self.projection_idx.item()), None, self.temperature[0])
+        return self._augment(z)
+
+    def pre_process_latent_full(self, z):
+        # full latent space, without projection
+        return self._augment(z)
+
+    def forward(self, x, crop_latent: bool = False):
+        z = self.encode_full(x)
+        if crop_latent:
+            z_dec = z[..., :self.latent_size, :]
+        else:
+            z_dec = z
+        return self.decode_full(z_dec, from_forward=True)
+
+
+class VariationalScriptedRAVE(ContinuousScriptedRAVE):
+
+    def __init__(self, *args, **kwargs):
+        super(VariationalScriptedRAVE, self).__init__(*args, **kwargs)
+        self.register_method(
+            "encode_dist",
+            in_channels=self.n_channels,
+            in_ratio=self.encode_params[1],
+            out_channels=self.latent_size * 2,
+            out_ratio=self.encode_params[3],
+            input_labels=['(signal) Channel %d'%d for d in range(1, self.n_channels+1)],
+            output_labels=[
+                f'(signal) Latent mean {i + 1}'
+                for i in range(self.latent_size)
+            ] + [
+                f'(signal) Latent std {i + 1}'
+                for i in range(self.latent_size)
+            ],
+        )
+    
     @torch.jit.export
     def encode_dist(self, x):
         if self.stereo_mode:
@@ -703,45 +765,8 @@ class VariationalScriptedRAVE(ScriptedRAVE):
         std = std[:, :self.latent_size]
         return torch.cat([z, std], dim=-2)
 
-    def post_process_latent(self, z):
-        # the latent is projected with the selected projection (set_projection / nn~
-        # "projection" attribute); "default" is the PCA of the model.
-        z = self.encoder.reparametrize(z, temperature=self.temperature[0])[0]
-        if self.use_pca:
-            z = self.projections(z, int(self.projection_idx.item()), self.latent_size)
-        z = z[:, :self.latent_size]
-        return z
-       
-    def post_process_latent_full(self, z):
-        # full latent space, without projection
+    def _reparametrize(self, z):
         return self.encoder.reparametrize(z, temperature=self.temperature[0])[0]
- 
-    def pre_process_latent(self, z):
-        if self.use_pca:
-            # missing dimensions are completed by the projection (noise * temperature)
-            return self.projections.inverse(z, int(self.projection_idx.item()), None, self.temperature[0])
-        if z.shape[1] < self.full_latent_size:
-            noise = torch.randn(
-                z.shape[0],
-                self.full_latent_size - z.shape[1],
-                z.shape[-1],
-            ).type_as(z)
-            z = torch.cat([z, noise * self.temperature[0]], 1)
-        return z
-
-    def pre_process_latent_full(self, z):
-        # full latent space, without projection
-        return z
-
-        
-    def forward(self, x, crop_latent: bool = False):
-        z = self.encode_full(x)
-        if crop_latent:
-            z_dec = z[..., :self.latent_size, :]
-        else:
-            z_dec = z
-        return self.decode_full(z_dec, from_forward=True)
-
 
 
 class DiscreteScriptedRAVE(ScriptedRAVE):
@@ -769,16 +794,9 @@ class DiscreteScriptedRAVE(ScriptedRAVE):
 
 
 
-class WasserteinScriptedRAVE(ScriptedRAVE):
+class WasserteinScriptedRAVE(ContinuousScriptedRAVE):
 
-    def __init__(self, *args, **kwargs):
-        super(WasserteinScriptedRAVE, self).__init__(*args,**kwargs)
-        assert self.latent_size < self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
-
-    def post_process_latent(self, z):
-        return z
-
-    def pre_process_latent(self, z):
+    def _augment(self, z):
         if self.encoder.noise_augmentation:
             noise = torch.randn(z.shape[0], self.encoder.noise_augmentation,
                                 z.shape[-1]).type_as(z)
@@ -990,12 +1008,10 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
       * if pls / cca: PLS / CCA with audio descriptors (default: all DESCRIPTORS; f0 tracked
         with pitch_mode), with latent_size components (at most the number of descriptors
         for cca; default: number of descriptors).
-    ica / mapper / sfa require latent_size.
+    ica / mapper / sfa use latent_size, defaulting to the latent size reached by fidelity.
     Returns {"buffers": {name: tensor}, "projections": {name: buffer},
              "extra_projections": {name: RAVEProjection}}."""
     from . import load_rave_checkpoint, get_run_name
-    if (ica or mapper or sfa) and latent_size is None:
-        raise ValueError("ica / mapper / sfa projections require an explicit latent_size")
     desc_names = list(descriptors or DESCRIPTORS)
     use_descriptors = pls or cca
     cached_state = cc.use_cached_conv.__globals__["USE_CACHED_CONV"]
@@ -1014,14 +1030,21 @@ def compute_dataset_projections(run, db_path, partition="all", ica=False, mapper
     z = data["latents"] if use_descriptors else data
     out = {"buffers": {}, "projections": {}, "extra_projections": {}}
 
-    if isinstance(model.encoder, blocks.VariationalEncoder):
-        z_mean = z.chunk(2, 1)[0]
-        components, mean, var = model._compute_pca(z_mean)  # PCA on posterior means
+    var = None
+    if isinstance(model.encoder, (blocks.VariationalEncoder, blocks.WasserteinEncoder)):
+        # PCA on posterior means (variational) / latents (wasserstein)
+        z_mean = z.chunk(2, 1)[0] if isinstance(model.encoder, blocks.VariationalEncoder) else z
+        components, mean, var = model._compute_pca(z_mean)
         out["buffers"] = {"latent_pca": components.float(), "latent_mean": mean.float(), "fidelity": var.float()}
         _log.info("dataset PCA fidelity: " + ", ".join(
             f"{p}: {int(np.argmax(var.numpy() > p))}" for p in (.8, .9, .95, .99)))
     else:
         z_mean = z
+    if (ica or mapper or sfa) and latent_size is None:
+        latent_size = latent_size_from_fidelity(var if var is not None else model.fidelity, fidelity,
+                                                model.latent_size)
+        _log.info(f"latent_size not given: ica / mapper / sfa projections use the latent size from fidelity "
+                  f"{fidelity} ({latent_size})")
     k = int(latent_size) if latent_size is not None else None
 
     if ica:
@@ -1058,7 +1081,9 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
         streaming: use cached convolutions (realtime mode).
         fidelity: fidelity used to choose the latent size (variational models only).
         latent_size: fixed latent size (overrides fidelity).
-        no_pca: disables PCA in latent space (variational models only).
+        no_pca: the default projection is the raw latent space (no PCA), and the latent size is the full
+            latent size of the model. Automatically set for Wasserstein models without db_path (they do
+            not compute a PCA during training).
         ema_weights: use EMA weights if available.
         sr: optional target sampling rate (resampling).
         prior: optional prior run.
@@ -1068,11 +1093,11 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
             fidelity / latent size), and to fit the ica / mapper projections.
         db_partition: "all" (train + val, default), "train" or "val".
         ica: add an ICA projection ("ica"), on the PCA-whitened subspace of dimension
-            latent_size (requires db_path and latent_size).
+            latent_size (requires db_path; latent_size defaults to the one reached by fidelity).
         mapper: add a Mapper projection ("mapper"), MLP autoencoder with a bottleneck of
-            dimension latent_size (requires db_path and latent_size).
+            dimension latent_size (requires db_path; latent_size defaults to the one reached by fidelity).
         sfa: add a slow feature analysis projection ("sfa") on the PCA-whitened subspace of
-            dimension latent_size (requires db_path and latent_size).
+            dimension latent_size (requires db_path; latent_size defaults to the one reached by fidelity).
         pls, cca: add PLS / CCA projections ("pls", "cca") aligned with audio descriptors
             (requires db_path).
         descriptors: descriptors used by pls / cca (default: all, see projections.DESCRIPTORS).
@@ -1085,8 +1110,6 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
     from . import load_rave_checkpoint, get_run_name
     if (ica or mapper or sfa or pls or cca) and db_path is None:
         raise ValueError("ica / mapper / sfa / pls / cca projections require a dataset (db_path)")
-    if (ica or mapper or sfa) and latent_size is None:
-        raise ValueError("ica / mapper / sfa projections require an explicit latent_size")
     dataset_projections = None
     if db_path is not None:
         dataset_projections = compute_dataset_projections(
@@ -1116,10 +1139,25 @@ def export(run, out_path=None, name=None, streaming=False, fidelity=.95, latent_
         model_name = name or get_run_name(model_path) or Path(run).stem
         script_class = _script_class_for(pretrained)
         class_kwargs = {}
-        if no_pca and script_class is VariationalScriptedRAVE:
-            class_kwargs['use_pca'] = False
-            fidelity, latent_size = None, None
-            model_name += "_nopca"
+        if issubclass(script_class, ContinuousScriptedRAVE):
+            full_latent_size = pretrained.latent_size
+            if script_class is WasserteinScriptedRAVE and not no_pca and not bool((pretrained.fidelity > 0).any()):
+                # wasserstein models do not compute a PCA during training: requires db_path
+                _log.warning("Wasserstein model exported without db_path: no PCA available, the latent space is "
+                             f"exported raw (no_pca, latent size {full_latent_size}). Give db_path to compute it.")
+                no_pca = True
+            if no_pca:
+                if latent_size is not None and latent_size != full_latent_size:
+                    _log.warning(f"latent_size={latent_size} ignored with no_pca: latent size fixed to "
+                                 f"{full_latent_size}")
+                class_kwargs['use_pca'] = False
+                fidelity, latent_size = None, full_latent_size
+                model_name += "_nopca"
+            elif latent_size is None:
+                latent_size = latent_size_from_fidelity(pretrained.fidelity, fidelity, full_latent_size)
+                _log.info(f"latent size from fidelity {fidelity}: {latent_size}")
+            else:
+                assert 0 < latent_size <= full_latent_size, f"latent_size must be in [1, {full_latent_size}]"
         if streaming:
             _prepare_streaming_stft(pretrained, use_causal_stft)
 

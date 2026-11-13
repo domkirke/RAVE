@@ -32,19 +32,20 @@ flags.DEFINE_float(
     default=.95,
     lower_bound=.1,
     upper_bound=.999,
-    help='Fidelity to use during inference (Variational mode only)')
+    help='explained variance of the PCA defining the latent size, if --latent_size is not given')
 
 flags.DEFINE_integer(
     'latent_size',
     default=None,
     lower_bound = 0,
-    help = "Defines a fixed latent space for RAVE (overrides --fidelity)"
+    help = "number of PCA dimensions of the latent space, up to the full latent size (overrides --fidelity). Requires --db_path for Wasserstein models"
 )
 
 flags.DEFINE_bool(
     'no_pca', 
     default = False,
-    help = "disables PCA in latent space (latent size is forced to 128)"
+    help = "default projection is the raw latent space (no PCA), with the full latent size of the model. "
+           "Automatic for Wasserstein models without --db_path"
 )
 
 flags.DEFINE_string('name', 
@@ -67,10 +68,10 @@ flags.DEFINE_string('db_path',
                     help='dataset used to recompute the PCA (and fidelity) from its latents')
 flags.DEFINE_enum('db_partition', 'all', ['all', 'train', 'val'],
                   help='part of the dataset used with --db_path (all = train + val)')
-flags.DEFINE_bool('ica', default=False, help='add an ICA projection computed on --db_path, on --latent_size whitened PCA components (requires --latent_size)')
-flags.DEFINE_bool('mapper', default=False, help='add a Mapper projection (MLP autoencoder, bottleneck of --latent_size) trained on --db_path (requires --latent_size)')
+flags.DEFINE_bool('ica', default=False, help='add an ICA projection computed on --db_path, on --latent_size whitened PCA components (default: latent size from --fidelity)')
+flags.DEFINE_bool('mapper', default=False, help='add a Mapper projection (MLP autoencoder, bottleneck of --latent_size) trained on --db_path (default: latent size from --fidelity)')
 flags.DEFINE_bool('sfa', default=False, help='add a slow feature analysis projection computed on --db_path, on '
-                  '--latent_size whitened PCA components (requires --latent_size)')
+                  '--latent_size whitened PCA components (default: latent size from --fidelity)')
 flags.DEFINE_bool('pls', default=False, help='add a PLS projection aligned with audio --descriptors, computed on --db_path')
 flags.DEFINE_bool('cca', default=False, help='add a CCA projection aligned with audio --descriptors, computed on --db_path')
 flags.DEFINE_multi_enum('descriptors', None, ['loudness', 'centroid', 'bandwidth', 'flatness', 'f0'],

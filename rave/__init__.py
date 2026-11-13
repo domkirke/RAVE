@@ -23,6 +23,30 @@ gin.add_config_file_search_path(BASE_PATH.joinpath('configs'))
 #     AUGMENTATION_CONFIG_PATH.symlink_to(target_augment_config_path)
 
 
+def __legacy_cached_conv_aliases():
+    """backward compatibility: older cached_conv versions exposed everything in a single
+    `cached_conv.convs` module (referenced by old config.gin files as `from cached_conv import
+    convs`, `convs.get_padding.mode = ...`). Newer versions split it into `conv_1d` and `utils`;
+    register an alias module re-exporting the same objects, so that old bindings target the
+    functions actually used by the convolutions."""
+    import sys, types, importlib
+    if "cached_conv.convs" in sys.modules or hasattr(cc, "convs"):
+        return
+    convs = types.ModuleType("cached_conv.convs")
+    for sub in ("utils", "conv_1d"):
+        try:
+            mod = importlib.import_module(f"cached_conv.{sub}")
+        except ImportError:
+            continue
+        for k, v in vars(mod).items():
+            if not k.startswith("__"):
+                setattr(convs, k, v)
+    sys.modules["cached_conv.convs"] = convs
+    cc.convs = convs
+
+__legacy_cached_conv_aliases()
+
+
 def __safe_configurable(name):
     try: 
         setattr(cc, name, gin.get_configurable(f"cc.{name}"))
